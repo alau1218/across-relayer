@@ -15,5 +15,3 @@ dist
 
 # Debugging files
 *.log
-
-yarn.lock
