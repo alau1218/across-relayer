@@ -64,7 +64,8 @@
     "run-executor": "EXECUTOR_ENABLED=true node ./dist/index.js --dataworker",
     "run-proposer": "PROPOSER_ENABLED=true node ./dist/index.js --dataworker",
     "run-finalizer": "FINALIZER_ENABLED=true node ./dist/index.js --finalizer",
-    "relay": "yarn build && pm2 start ./dist/index.js --name across_bot -- --relayer --wallet mnemonic && pm2 monit",
+    "relay": "yarn build && node ./dist/index.js --relayer --wallet mnemonic",
+    "relayProd": "yarn build && pm2 start ./dist/index.js --name across_bot -- --relayer --wallet mnemonic && pm2 monit",
     "stopRelay": "pm2 stop across_bot",
     "deposit": "yarn ts-node ./scripts/spokepool.ts deposit",
     "dispute": "yarn ts-node ./scripts/hubpool.ts dispute"
