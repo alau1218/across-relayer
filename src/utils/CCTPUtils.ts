@@ -1,11 +1,13 @@
 import { utils } from "@across-protocol/sdk";
+import { PUBLIC_NETWORKS, CCTP_NO_DOMAIN } from "@across-protocol/constants";
 import { TransactionReceipt } from "@ethersproject/abstract-provider";
 import axios from "axios";
-import { BigNumber, ethers } from "ethers";
-import { CONTRACT_ADDRESSES, chainIdsToCctpDomains } from "../common";
-import { compareAddressesSimple } from "./AddressUtils";
+import { ethers } from "ethers";
+import { Log } from "../interfaces";
+import { CONTRACT_ADDRESSES } from "../common";
 import { EventSearchConfig, paginatedEventQuery } from "./EventUtils";
-import { bnZero } from "./SDKUtils";
+import { BigNumber } from "./BNUtils";
+import { bnZero, compareAddressesSimple } from "./SDKUtils";
 import { isDefined } from "./TypeGuards";
 import { getProvider } from "./ProviderUtils";
 
@@ -60,6 +62,14 @@ export function hashCCTPSourceAndNonce(source: number, nonce: number): string {
   return ethers.utils.keccak256(ethers.utils.solidityPack(["uint32", "uint64"], [source, nonce]));
 }
 
+export function getCctpDomainForChainId(chainId: number): number {
+  const cctpDomain = PUBLIC_NETWORKS[chainId]?.cctpDomain;
+  if (!isDefined(cctpDomain)) {
+    throw new Error(`No CCTP domain found for chainId: ${chainId}`);
+  }
+  return cctpDomain;
+}
+
 /**
  * Retrieves all outstanding CCTP bridge transfers for a given target -> destination chain, a source token address, and a from address.
  * @param sourceTokenMessenger The CCTP TokenMessenger contract on the source chain. The "Bridge Contract" of CCTP
@@ -80,9 +90,9 @@ export async function retrieveOutstandingCCTPBridgeUSDCTransfers(
   sourceChainId: number,
   destinationChainId: number,
   fromAddress: string
-): Promise<ethers.Event[]> {
-  const sourceDomain = chainIdsToCctpDomains[sourceChainId];
-  const targetDestinationDomain = chainIdsToCctpDomains[destinationChainId];
+): Promise<Log[]> {
+  const sourceDomain = getCctpDomainForChainId(sourceChainId);
+  const targetDestinationDomain = getCctpDomainForChainId(destinationChainId);
 
   const sourceFilter = sourceTokenMessenger.filters.DepositForBurn(undefined, sourceToken, undefined, fromAddress);
   const initializationTransactions = await paginatedEventQuery(sourceTokenMessenger, sourceFilter, sourceSearchConfig);
@@ -96,7 +106,7 @@ export async function retrieveOutstandingCCTPBridgeUSDCTransfers(
         return undefined;
       }
       // Call into the destinationMessageTransmitter contract to determine if the message has been processed
-      // on the destionation chain. We want to make sure the message **hasn't** been processed.
+      // on the destination chain. We want to make sure the message **hasn't** been processed.
       const isMessageProcessed = await hasCCTPMessageBeenProcessed(sourceDomain, nonce, destinationMessageTransmitter);
       if (isMessageProcessed) {
         return undefined;
@@ -127,12 +137,16 @@ export async function hasCCTPMessageBeenProcessed(
 }
 
 /**
- * Used to map a CCTP domain to a chain id. This is the inverse of chainIdsToCctpDomains.
+ * Used to map a CCTP domain to a chain id. This is the inverse of getCctpDomainForChainId.
  * Note: due to the nature of testnet/mainnet chain ids mapping to the same CCTP domain, we
  *       actually have a mapping of CCTP Domain -> [chainId].
  */
 export function getCctpDomainsToChainIds(): Record<number, number[]> {
-  return Object.entries(chainIdsToCctpDomains).reduce((acc, [chainId, cctpDomain]) => {
+  return Object.entries(PUBLIC_NETWORKS).reduce((acc, [chainId, networkInfo]) => {
+    const cctpDomain = networkInfo.cctpDomain;
+    if (cctpDomain === CCTP_NO_DOMAIN) {
+      return acc;
+    }
     if (!acc[cctpDomain]) {
       acc[cctpDomain] = [];
     }
@@ -221,23 +235,25 @@ async function _resolveCCTPRelatedTxns(
             return undefined;
           }
 
-          // Generate the attestation proof for the message. This is required to finalize the message.
-          const attestation = await generateCCTPAttestationProof(messageHash, utils.chainIsProd(destinationChainId));
+          // Check to see if the message has already been processed
+          const destinationProvider = await getProvider(destinationChainId);
+          const destinationMessageTransmitterContract = CONTRACT_ADDRESSES[destinationChainId].cctpMessageTransmitter;
+          const destinationMessageTransmitter = new ethers.Contract(
+            destinationMessageTransmitterContract.address,
+            destinationMessageTransmitterContract.abi,
+            destinationProvider
+          );
+          const processed = await hasCCTPMessageBeenProcessed(sourceDomain, nonce, destinationMessageTransmitter);
 
           let status: CCTPMessageStatus;
-          if (attestation.status === "pending_confirmations") {
-            status = "pending";
+          let attestation: Attestation | undefined = undefined;
+          if (processed) {
+            status = "finalized";
           } else {
-            // attestation proof is available so now check if its already been processed
-            const destinationProvider = await getProvider(destinationChainId);
-            const destinationMessageTransmitterContract = CONTRACT_ADDRESSES[destinationChainId].cctpMessageTransmitter;
-            const destinationMessageTransmitter = new ethers.Contract(
-              destinationMessageTransmitterContract.address,
-              destinationMessageTransmitterContract.abi,
-              destinationProvider
-            );
-            const processed = await hasCCTPMessageBeenProcessed(sourceDomain, nonce, destinationMessageTransmitter);
-            status = processed ? "finalized" : "ready";
+            // Generate the attestation proof for the message. This is required to finalize the message.
+            attestation = await generateCCTPAttestationProof(messageHash, utils.chainIsProd(destinationChainId));
+            // If the attestation proof is pending, we can't finalize the message yet.
+            status = attestation.status === "pending_confirmations" ? "pending" : "ready";
           }
 
           return {

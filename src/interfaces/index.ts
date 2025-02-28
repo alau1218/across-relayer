@@ -1,5 +1,5 @@
-import { BigNumber } from "ethers";
 import { interfaces } from "@across-protocol/sdk";
+import { BigNumber } from "../utils";
 
 export * from "./InventoryManagement";
 export * from "./SpokePool";
@@ -7,6 +7,7 @@ export * from "./Token";
 export * from "./Error";
 export * from "./Report";
 export * from "./Arweave";
+export * from "./BundleData";
 
 // Bridge interfaces
 export interface OutstandingTransfers {
@@ -21,6 +22,7 @@ export interface OutstandingTransfers {
 }
 
 // Common interfaces
+export type Log = interfaces.Log;
 export type SortableEvent = interfaces.SortableEvent;
 export type BigNumberForToken = interfaces.BigNumberForToken;
 
@@ -50,7 +52,7 @@ export type SetPoolRebalanceRoot = interfaces.SetPoolRebalanceRoot;
 export type PendingRootBundle = interfaces.PendingRootBundle;
 
 // SpokePool interfaces
-export type FundsDepositedEvent = interfaces.FundsDepositedEvent;
+export type RelayData = interfaces.RelayData;
 export type Deposit = interfaces.Deposit;
 export type DepositWithBlock = interfaces.DepositWithBlock;
 export type Fill = interfaces.Fill;
@@ -58,6 +60,7 @@ export type FillWithBlock = interfaces.FillWithBlock;
 export type SpeedUp = interfaces.SpeedUp;
 export type SlowFillRequest = interfaces.SlowFillRequest;
 export type SlowFillRequestWithBlock = interfaces.SlowFillRequestWithBlock;
+export type SlowFillLeaf = interfaces.SlowFillLeaf;
 export type RootBundleRelay = interfaces.RootBundleRelay;
 export type RootBundleRelayWithBlock = interfaces.RootBundleRelayWithBlock;
 export type RelayerRefundExecution = interfaces.RelayerRefundExecution;
@@ -68,12 +71,3 @@ export type TokensBridged = interfaces.TokensBridged;
 export const { FillType, FillStatus } = interfaces;
 
 export type CachingMechanismInterface = interfaces.CachingMechanismInterface;
-
-// V3 shims (to be removed later)
-export type V3RelayData = interfaces.RelayData;
-export type V3Deposit = interfaces.Deposit;
-export type V3DepositWithBlock = interfaces.DepositWithBlock;
-export type V3SpeedUp = interfaces.SpeedUp;
-export type V3Fill = interfaces.Fill;
-export type V3FillWithBlock = interfaces.FillWithBlock;
-export type V3SlowFillLeaf = interfaces.SlowFillLeaf;

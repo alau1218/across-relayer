@@ -1,10 +1,11 @@
 import assert from "assert";
 import winston from "winston";
-import { Event, utils as ethersUtils } from "ethers";
+import { utils as ethersUtils } from "ethers";
+import { utils as sdkUtils } from "@across-protocol/sdk";
+import { Log } from "../interfaces";
 import { getNetworkName } from "./NetworkUtils";
 import { dedupArray } from "./SDKUtils";
 import { isDefined } from "./TypeGuards";
-import { utils as sdkUtils } from "@across-protocol/sdk";
 
 export type EventSearchConfig = sdkUtils.EventSearchConfig;
 
@@ -20,17 +21,6 @@ export const {
   spreadEvent,
   spreadEventWithBlockNumber,
 } = sdkUtils;
-
-/**
- * Sub out the array component of `args` to ensure it's correctly stringified before transmission.
- * Stringification of an Ethers event can produce unreliable results for Event.args and it can be consolidated into an
- * array, dropping the named k/v pairs.
- * @param event An Ethers event.
- * @returns A modified Ethers event, ensuring that the Event.args object consists of named k/v pairs.
- */
-export function mangleEventArgs(event: Event): Event {
-  return { ...event, args: sdkUtils.spreadEvent(event.args) };
-}
 
 /**
  * @notice Returns an array with the same length as the passed in Event array where each index is assigned a new index
@@ -52,6 +42,8 @@ export function getUniqueLogIndex(events: { transactionHash: string }[]): number
   return logIndexesForMessage;
 }
 
+type QuorumEvent = Log & { providers: string[] };
+
 /**
  * EventManager can be used to obtain basic quorum validation of events emitted by multiple providers.
  * This can be useful with WebSockets, where events are emitted asynchronously.
@@ -59,20 +51,18 @@ export function getUniqueLogIndex(events: { transactionHash: string }[]): number
  */
 export class EventManager {
   public readonly chain: string;
-  public readonly events: { [blockNumber: number]: (Event & { providers: string[] })[] } = {};
-  public readonly finality: number;
+  public readonly events: { [blockNumber: number]: QuorumEvent[] } = {};
+  public readonly processedEvents: Set<string> = new Set();
 
   private blockNumber: number;
 
   constructor(
     private readonly logger: winston.Logger,
     public readonly chainId: number,
-    finality: number,
     public readonly quorum: number
   ) {
     this.chain = getNetworkName(chainId);
     this.blockNumber = 0;
-    this.finality = Math.max(finality, 1);
   }
 
   /**
@@ -83,7 +73,7 @@ export class EventManager {
    * @param event Event to search for.
    * @returns The matching event, or undefined.
    */
-  findEvent(event: Event): (Event & { providers: string[] }) | undefined {
+  findEvent(event: Log): QuorumEvent | undefined {
     return this.events[event.blockNumber]?.find(
       (storedEvent) =>
         storedEvent.logIndex === event.logIndex &&
@@ -94,11 +84,33 @@ export class EventManager {
   }
 
   /**
-   * For a given Ethers Event, identify its quorum based on the number of unique providers that have supplied it.
-   * @param event An Ethers Event with appended provider information.
+   * For a given Log, verify whether it has already been processed.
+   * @param event An Log instance to check.
+   * @returns True if the event has been processed, else false.
+   */
+  protected isEventProcessed(event: Log): boolean {
+    // Protect against re-sending this event if it later arrives from another provider.
+    const eventKey = this.hashEvent(event);
+    return this.processedEvents.has(eventKey);
+  }
+
+  /**
+   * For a given Log, mark it has having been been processed.
+   * @param event A Log instance to mark processed.
+   * @returns void
+   */
+  protected markEventProcessed(event: Log): void {
+    // Protect against re-sending this event if it later arrives from another provider.
+    const eventKey = this.hashEvent(event);
+    this.processedEvents.add(eventKey);
+  }
+
+  /**
+   * For a given Log, identify its quorum based on the number of unique providers that have supplied it.
+   * @param event A Log instance with appended provider information.
    * @returns The number of unique providers that reported this event.
    */
-  getEventQuorum(event: Event): number {
+  getEventQuorum(event: Log): number {
     const storedEvent = this.findEvent(event);
     return isDefined(storedEvent) ? dedupArray(storedEvent.providers).length : 0;
   }
@@ -112,8 +124,12 @@ export class EventManager {
    * @param provider A string uniquely identifying the provider that supplied the event.
    * @returns void
    */
-  add(event: Event, provider: string): void {
+  add(event: Log, provider: string): void {
     assert(!event.removed);
+
+    if (this.isEventProcessed(event)) {
+      return;
+    }
 
     // If `eventHash` is not recorded in `eventHashes` then it's presumed to be a new event. If it is
     // already found in the `eventHashes` array, then at least one provider has already supplied it.
@@ -139,7 +155,7 @@ export class EventManager {
    * @param provider A string uniquely identifying the provider that supplied the event.
    * @returns void
    */
-  remove(event: Event, provider: string): void {
+  remove(event: Log, provider: string): void {
     assert(event.removed);
 
     const events = this.events[event.blockNumber] ?? [];
@@ -163,39 +179,34 @@ export class EventManager {
   }
 
   /**
-   * Record a new block. This function triggers the existing queue of pending events to be evaluated for basic finality.
-   * Events meeting finality criteria are submitted to the parent process (if defined). Events submitted are
+   * Record a new block. This function triggers the existing queue of pending events to be evaluated for quorum.
+   * Events meeting quorum criteria are submitted to the parent process (if defined). Events submitted are
    * subsequently flushed from this class.
    * @param blockNumber Number of the latest block.
    * @returns void
    */
-  tick(blockNumber: number): Event[] {
+  tick(blockNumber: number): Log[] {
     this.blockNumber = blockNumber > this.blockNumber ? blockNumber : this.blockNumber;
+    const blockNumbers = Object.keys(this.events)
+      .map(Number)
+      .sort((x, y) => x - y);
+    const quorumEvents: QuorumEvent[] = [];
 
-    // After `finality` blocks behind head, events for a block are considered finalised.
-    // This is configurable and will almost always be less than chain finality guarantees.
-    const finalised = blockNumber - this.finality;
-
-    // Collect the events that met quorum, stripping out the provider information; drop any that didn't.
-    // This can be brittle when finality is low (i.e. 1). @todo: Support querying back over multiple blocks
-    // to account for RPC notification delays.
-    const events = (this.events[finalised] ?? [])
-      .filter((event) => {
-        const eventQuorum = this.getEventQuorum(event);
-        if (this.quorum > eventQuorum) {
-          this.logger.debug({
-            at: "EventManager::tick",
-            message: `Dropped ${this.chain} ${event.event} event due to insufficient quorum.`,
-          });
+    blockNumbers.forEach((blockNumber) => {
+      // Filter out events that have reached quorum for propagation.
+      this.events[blockNumber] = this.events[blockNumber].filter((event) => {
+        if (this.quorum > this.getEventQuorum(event)) {
+          return true; // No quorum; retain for next time.
         }
-        return eventQuorum >= this.quorum;
-      })
-      .map(({ providers, ...event }) => event);
 
-    // Flush the events that were just submitted.
-    delete this.events[finalised];
+        this.markEventProcessed(event);
+        quorumEvents.push(event);
+        return false;
+      });
+    });
 
-    return events;
+    // Strip out the quorum information before returning.
+    return quorumEvents.map(({ providers, ...event }) => event);
   }
 
   /**
@@ -203,10 +214,10 @@ export class EventManager {
    * @param event An Ethers event to be hashed.
    * @returns A SHA256 string derived from the event.
    */
-  hashEvent(event: Event): string {
+  hashEvent(event: Log): string {
     const { event: eventName, blockNumber, blockHash, transactionHash, transactionIndex, logIndex, args } = event;
-    return ethersUtils.id(
-      `${eventName}-${blockNumber}-${blockHash}-${transactionHash}-${transactionIndex}-${logIndex}-${args.join("-")}`
-    );
+    const _args = Object.values(args).join("-");
+    const key = `${eventName}-${blockNumber}-${blockHash}-${transactionHash}-${transactionIndex}-${logIndex}-${_args}`;
+    return ethersUtils.id(key);
   }
 }

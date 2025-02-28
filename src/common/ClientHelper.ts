@@ -18,6 +18,7 @@ import { HubPoolClient, MultiCallerClient, ConfigStoreClient, SpokePoolClient } 
 import { CommonConfig } from "./Config";
 import { SpokePoolClientsByChain } from "../interfaces";
 import { caching, clients, utils as sdkUtils } from "@across-protocol/sdk";
+import V3_SPOKE_POOL_ABI from "./abi/V3SpokePool.json";
 
 export interface Clients {
   hubPoolClient: HubPoolClient;
@@ -204,7 +205,13 @@ export async function constructSpokePoolClientsWithStartBlocks(
   const spokePools = await Promise.all(
     enabledChains.map(async (chainId) => {
       const spokePoolAddr = hubPoolClient.getSpokePoolForBlock(chainId, toBlockOverride[1]);
-      const spokePoolContract = SpokePool.connect(spokePoolAddr, spokePoolSigners[chainId]);
+      // TODO: initialize using typechain factory after V3.5 migration.
+      // const spokePoolContract = SpokePool.connect(spokePoolAddr, spokePoolSigners[chainId]);
+      const spokePoolContract = new ethers.Contract(
+        spokePoolAddr,
+        [...SpokePool.abi, ...V3_SPOKE_POOL_ABI],
+        spokePoolSigners[chainId]
+      );
       const registrationBlock = await resolveSpokePoolActivationBlock(chainId, hubPoolClient, toBlockOverride[1]);
       return { chainId, contract: spokePoolContract, registrationBlock };
     })
@@ -357,9 +364,9 @@ export async function constructClients(
 
 // @dev The HubPoolClient is dependent on the state of the ConfigStoreClient,
 //      so update the ConfigStoreClient first.
-export async function updateClients(clients: Clients, config: CommonConfig): Promise<void> {
+export async function updateClients(clients: Clients, config: CommonConfig, logger?: winston.Logger): Promise<void> {
   await clients.configStoreClient.update();
-  config.loadAndValidateConfigForChains(clients.configStoreClient.getChainIdIndicesForBlock());
+  config.validate(clients.configStoreClient.getChainIdIndicesForBlock(), logger);
 }
 
 export function spokePoolClientsToProviders(spokePoolClients: { [chainId: number]: SpokePoolClient }): {

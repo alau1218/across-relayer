@@ -1,4 +1,4 @@
-import { BigNumber, ERC20, ethers, min, getEthAddressForChain } from "../utils";
+import { BigNumber, ERC20, ethers, min, getNativeTokenAddressForChain } from "../utils";
 
 // This type is used to map used and current balances of different users.
 export interface BalanceMap {
@@ -97,10 +97,16 @@ export class BalanceAllocator {
     return this.requestBalanceAllocations([{ chainId, tokens, holder, amount }]);
   }
 
+  async getBalanceSubUsed(chainId: number, token: string, holder: string): Promise<BigNumber> {
+    const balance = await this.getBalance(chainId, token, holder);
+    const used = this.getUsed(chainId, token, holder);
+    return balance.sub(used);
+  }
+
   async getBalance(chainId: number, token: string, holder: string): Promise<BigNumber> {
     if (!this.balances?.[chainId]?.[token]?.[holder]) {
       const balance = await this._queryBalance(chainId, token, holder);
-      // To avoid inconsitencies, we recheck the balances value after the query.
+      // To avoid inconsistencies, we recheck the balances value after the query.
       // If it exists, skip the assignment so the value doesn't change after being set.
       if (!this.balances?.[chainId]?.[token]?.[holder]) {
         // Note: cannot use assign because it breaks the BigNumber object.
@@ -112,6 +118,12 @@ export class BalanceAllocator {
       }
     }
     return this.balances[chainId][token][holder];
+  }
+
+  testSetBalance(chainId: number, token: string, holder: string, balance: BigNumber): void {
+    this.balances[chainId] ??= {};
+    this.balances[chainId][token] ??= {};
+    this.balances[chainId][token][holder] = balance;
   }
 
   getUsed(chainId: number, token: string, holder: string): BigNumber {
@@ -141,9 +153,9 @@ export class BalanceAllocator {
     this.balances = {};
   }
 
-  // This method is primarily here to be overriden for testing purposes.
+  // This method is primarily here to be overridden for testing purposes.
   protected async _queryBalance(chainId: number, token: string, holder: string): Promise<BigNumber> {
-    return getEthAddressForChain(chainId).toLowerCase() === token.toLowerCase()
+    return getNativeTokenAddressForChain(chainId).toLowerCase() === token.toLowerCase()
       ? await this.providers[chainId].getBalance(holder)
       : await ERC20.connect(token, this.providers[chainId]).balanceOf(holder);
   }

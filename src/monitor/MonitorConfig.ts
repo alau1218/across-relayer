@@ -1,5 +1,6 @@
+import winston from "winston";
 import { CommonConfig, ProcessEnv } from "../common";
-import { ethers, getEthAddressForChain } from "../utils";
+import { ethers, getNativeTokenAddressForChain, isDefined } from "../utils";
 
 // Set modes to true that you want to enable in the AcrossMonitor bot.
 export interface BotModes {
@@ -9,6 +10,7 @@ export interface BotModes {
   stuckRebalancesEnabled: boolean;
   utilizationEnabled: boolean; // Monitors pool utilization ratio
   unknownRootBundleCallersEnabled: boolean; // Monitors relay related events triggered by non-whitelisted addresses
+  spokePoolBalanceReportEnabled: boolean;
 }
 
 export class MonitorConfig extends CommonConfig {
@@ -19,9 +21,12 @@ export class MonitorConfig extends CommonConfig {
   readonly hubPoolEndingBlock: number | undefined;
   readonly stuckRebalancesEnabled: boolean;
   readonly monitoredRelayers: string[];
+  readonly monitoredSpokePoolChains: number[];
+  readonly monitoredTokenSymbols: string[];
   readonly whitelistedDataworkers: string[];
   readonly whitelistedRelayers: string[];
   readonly knownV1Addresses: string[];
+  readonly bundlesCount: number;
   readonly botModes: BotModes;
   readonly refillEnabledBalances: {
     chainId: number;
@@ -38,6 +43,9 @@ export class MonitorConfig extends CommonConfig {
     account: string;
     token: string;
   }[] = [];
+
+  // TODO: Remove this config once we fully migrate to generic adapters.
+  readonly useGenericAdapter: boolean;
 
   constructor(env: ProcessEnv) {
     super(env);
@@ -58,6 +66,10 @@ export class MonitorConfig extends CommonConfig {
       REFILL_BALANCES,
       REFILL_BALANCES_ENABLED,
       STUCK_REBALANCES_ENABLED,
+      REPORT_SPOKE_POOL_BALANCES,
+      MONITORED_SPOKE_POOL_CHAINS,
+      MONITORED_TOKEN_SYMBOLS,
+      BUNDLES_COUNT,
     } = env;
 
     this.botModes = {
@@ -67,6 +79,7 @@ export class MonitorConfig extends CommonConfig {
       utilizationEnabled: UTILIZATION_ENABLED === "true",
       unknownRootBundleCallersEnabled: UNKNOWN_ROOT_BUNDLE_CALLERS_ENABLED === "true",
       stuckRebalancesEnabled: STUCK_REBALANCES_ENABLED === "true",
+      spokePoolBalanceReportEnabled: REPORT_SPOKE_POOL_BALANCES === "true",
     };
 
     // Used to monitor activities not from whitelisted data workers or relayers.
@@ -76,6 +89,9 @@ export class MonitorConfig extends CommonConfig {
     // Used to monitor balances, activities, etc. from the specified relayers.
     this.monitoredRelayers = parseAddressesOptional(MONITORED_RELAYERS);
     this.knownV1Addresses = parseAddressesOptional(KNOWN_V1_ADDRESSES);
+    this.monitoredSpokePoolChains = JSON.parse(MONITORED_SPOKE_POOL_CHAINS ?? "[]");
+    this.monitoredTokenSymbols = JSON.parse(MONITORED_TOKEN_SYMBOLS ?? "[]");
+    this.bundlesCount = Number(BUNDLES_COUNT ?? 4);
 
     // Used to send tokens if available in wallet to balances under target balances.
     if (REFILL_BALANCES) {
@@ -99,7 +115,7 @@ export class MonitorConfig extends CommonConfig {
             // Optional fields that will set to defaults:
             isHubPool: Boolean(isHubPool),
             // Fields that are always set to defaults:
-            token: getEthAddressForChain(chainId),
+            token: getNativeTokenAddressForChain(chainId),
           };
         }
       );
@@ -127,12 +143,12 @@ export class MonitorConfig extends CommonConfig {
     if (MONITORED_BALANCES) {
       this.monitoredBalances = JSON.parse(MONITORED_BALANCES).map(
         ({ errorThreshold, warnThreshold, account, token, chainId }) => {
-          if (!errorThreshold && !warnThreshold) {
+          if (!isDefined(errorThreshold) && !isDefined(warnThreshold)) {
             throw new Error("Must provide either an errorThreshold or a warnThreshold");
           }
 
           let parsedErrorThreshold: number | null = null;
-          if (errorThreshold) {
+          if (isDefined(errorThreshold)) {
             if (Number.isNaN(Number(errorThreshold))) {
               throw new Error(`errorThreshold value: ${errorThreshold} cannot be converted to a number`);
             }
@@ -140,16 +156,16 @@ export class MonitorConfig extends CommonConfig {
           }
 
           let parsedWarnThreshold: number | null = null;
-          if (warnThreshold) {
+          if (isDefined(warnThreshold)) {
             if (Number.isNaN(Number(errorThreshold))) {
               throw new Error(`warnThreshold value: ${warnThreshold} cannot be converted to a number`);
             }
             parsedWarnThreshold = Number(warnThreshold);
           }
 
-          const isNativeToken = !token || token === "0x0" || token === getEthAddressForChain(chainId);
+          const isNativeToken = !token || token === getNativeTokenAddressForChain(chainId);
           return {
-            token: isNativeToken ? getEthAddressForChain(chainId) : token,
+            token: isNativeToken ? getNativeTokenAddressForChain(chainId) : token,
             errorThreshold: parsedErrorThreshold,
             warnThreshold: parsedWarnThreshold,
             account: ethers.utils.getAddress(account),
@@ -160,19 +176,16 @@ export class MonitorConfig extends CommonConfig {
     }
   }
 
-  loadAndValidateConfigForChains(chainIdIndices: number[]): void {
+  override validate(chainIds: number[], logger: winston.Logger): void {
+    super.validate(chainIds, logger);
+
     // Min deposit confirmations seems like the most likely constant to have all possible chain IDs listed.
-    chainIdIndices.forEach((chainId) => {
+    chainIds.forEach((chainId) => {
       this.spokePoolsBlocks[chainId] = {
-        startingBlock: process.env[`STARTING_BLOCK_NUMBER_${chainId}`]
-          ? Number(process.env[`STARTING_BLOCK_NUMBER_${chainId}`])
-          : undefined,
-        endingBlock: process.env[`ENDING_BLOCK_NUMBER_${chainId}`]
-          ? Number(process.env[`ENDING_BLOCK_NUMBER_${chainId}`])
-          : undefined,
+        startingBlock: Number(process.env[`STARTING_BLOCK_NUMBER_${chainId}`]) || undefined,
+        endingBlock: Number(process.env[`ENDING_BLOCK_NUMBER_${chainId}`]) || undefined,
       };
     });
-    super.loadAndValidateConfigForChains(chainIdIndices);
   }
 }
 

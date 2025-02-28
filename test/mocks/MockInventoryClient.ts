@@ -1,11 +1,12 @@
 import { Deposit, InventoryConfig } from "../../src/interfaces";
 import { BundleDataClient, HubPoolClient, InventoryClient, Rebalance, TokenClient } from "../../src/clients";
 import { AdapterManager, CrossChainTransferClient } from "../../src/clients/bridges";
-import { BigNumber } from "ethers";
+import { BigNumber, bnZero } from "../../src/utils";
 import winston from "winston";
+
 export class MockInventoryClient extends InventoryClient {
   possibleRebalances: Rebalance[] = [];
-  balanceOnChain: BigNumber = BigNumber.from(0);
+  balanceOnChain: BigNumber | undefined = bnZero;
   excessRunningBalancePcts: { [l1Token: string]: { [chainId: number]: BigNumber } } = {};
 
   constructor(
@@ -57,11 +58,11 @@ export class MockInventoryClient extends InventoryClient {
     return this.possibleRebalances;
   }
 
-  setBalanceOnChainForL1Token(newBalance: BigNumber): void {
+  setBalanceOnChainForL1Token(newBalance: BigNumber | undefined): void {
     this.balanceOnChain = newBalance;
   }
 
-  override getBalanceOnChain(): BigNumber {
-    return this.balanceOnChain;
+  override getBalanceOnChain(chainId: number, l1Token: string, l2Token?: string): BigNumber {
+    return this.balanceOnChain ?? super.getBalanceOnChain(chainId, l1Token, l2Token);
   }
 }

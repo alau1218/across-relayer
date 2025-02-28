@@ -1,5 +1,5 @@
 import { CHAIN_IDs, TOKEN_SYMBOLS_MAP } from "@across-protocol/constants";
-import { BigNumber, ethers, isDefined } from ".";
+import { BigNumber, compareAddressesSimple, ethers, isDefined } from ".";
 
 export function compareAddresses(addressA: string, addressB: string): 1 | -1 | 0 {
   // Convert address strings to BigNumbers and then sort numerical value of the BigNumber, which sorts the addresses
@@ -13,13 +13,6 @@ export function compareAddresses(addressA: string, addressB: string): 1 | -1 | 0
   } else {
     return 0;
   }
-}
-
-export function compareAddressesSimple(addressA?: string, addressB?: string): boolean {
-  if (addressA === undefined || addressB === undefined) {
-    return false;
-  }
-  return addressA.toLowerCase() === addressB.toLowerCase();
 }
 
 export function includesAddressSimple(address: string | undefined, list: string[]): boolean {
@@ -83,7 +76,7 @@ export function getTokenAddress(tokenAddress: string, chainId: number, targetCha
   return targetAddress;
 }
 
-export function getTokenAddressWithCCTP(
+export function getTranslatedTokenAddress(
   l1Token: string,
   hubChainId: number,
   l2ChainId: number,
@@ -95,20 +88,18 @@ export function getTokenAddressWithCCTP(
   }
   if (compareAddressesSimple(l1Token, TOKEN_SYMBOLS_MAP.USDC.addresses[hubChainId])) {
     const onBase = l2ChainId === CHAIN_IDs.BASE || l2ChainId === CHAIN_IDs.BASE_SEPOLIA;
-    return TOKEN_SYMBOLS_MAP[isNativeUsdc ? "USDC" : onBase ? "USDbC" : "USDC.e"].addresses[l2ChainId];
+    const onZora = l2ChainId === CHAIN_IDs.ZORA;
+    return isNativeUsdc
+      ? TOKEN_SYMBOLS_MAP.USDC.addresses[l2ChainId]
+      : TOKEN_SYMBOLS_MAP[onBase ? "USDbC" : onZora ? "USDzC" : "USDC.e"].addresses[l2ChainId];
+  } else if (
+    l2ChainId === CHAIN_IDs.BLAST &&
+    compareAddressesSimple(l1Token, TOKEN_SYMBOLS_MAP.DAI.addresses[hubChainId])
+  ) {
+    return TOKEN_SYMBOLS_MAP.USDB.addresses[l2ChainId];
   }
-  return getTokenAddress(l1Token, hubChainId, l2ChainId);
-}
 
-/**
- * Get the USDC symbol for the given token address and chain ID.
- * @param l2Token A Web3 token address (not case sensitive)
- * @param chainId A chain Id to reference
- * @returns Either USDC (if native) or USDbC/USDC.e (if bridged) or undefined if the token address is not recognized.
- */
-export function getUsdcSymbol(l2Token: string, chainId: number): string | undefined {
-  const compareToken = (token?: string) => isDefined(token) && compareAddressesSimple(l2Token, token);
-  return ["USDC", "USDbC", "USDC.e"].find((token) => compareToken(TOKEN_SYMBOLS_MAP[token]?.addresses?.[chainId]));
+  return getTokenAddress(l1Token, hubChainId, l2ChainId);
 }
 
 export function checkAddressChecksum(tokenAddress: string): boolean {

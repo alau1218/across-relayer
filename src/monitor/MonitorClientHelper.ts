@@ -1,7 +1,6 @@
 import { MonitorConfig } from "./MonitorConfig";
 import { Signer, winston } from "../utils";
 import { BundleDataClient, HubPoolClient, TokenTransferClient } from "../clients";
-import { AdapterManager, CrossChainTransferClient } from "../clients/bridges";
 import {
   Clients,
   updateClients,
@@ -10,6 +9,7 @@ import {
   constructSpokePoolClientsWithLookback,
 } from "../common";
 import { SpokePoolClientsByChain } from "../interfaces";
+import { AdapterManager, CrossChainTransferClient } from "../clients/bridges";
 
 export interface MonitorClients extends Clients {
   bundleDataClient: BundleDataClient;
@@ -28,7 +28,7 @@ export async function constructMonitorClients(
   const commonClients = await constructClients(logger, config, baseSigner);
   const { hubPoolClient, configStoreClient } = commonClients;
 
-  await updateClients(commonClients, config);
+  await updateClients(commonClients, config, logger);
   await hubPoolClient.update();
 
   // Construct spoke pool clients for all chains that are not *currently* disabled. Caller can override
@@ -83,9 +83,9 @@ export async function updateMonitorClients(clients: MonitorClients): Promise<voi
   await updateSpokePoolClients(clients.spokePoolClients, [
     "RelayedRootBundle",
     "ExecutedRelayerRefundRoot",
-    "V3FundsDeposited",
-    "RequestedSpeedUpV3Deposit",
-    "FilledV3Relay",
+    "FundsDeposited",
+    "RequestedSpeedUpDeposit",
+    "FilledRelay",
   ]);
   const allL1Tokens = clients.hubPoolClient.getL1Tokens().map((l1Token) => l1Token.address);
   await clients.crossChainTransferClient.update(allL1Tokens);

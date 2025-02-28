@@ -1,16 +1,13 @@
-import { Contract, Event, providers, utils as ethersUtils } from "ethers";
+import { Contract, utils as ethersUtils } from "ethers";
 import winston from "winston";
 import { Result } from "@ethersproject/abi";
 import { CHAIN_IDs } from "@across-protocol/constants";
 import { constants, utils as sdkUtils } from "@across-protocol/sdk";
 import { IndexedSpokePoolClient } from "../src/clients";
-import { EventSearchConfig, mangleEventArgs, sortEventsAscending, sortEventsAscendingInPlace } from "../src/utils";
+import { Log } from "../src/interfaces";
+import { EventSearchConfig, sortEventsAscending, sortEventsAscendingInPlace } from "../src/utils";
 import { SpokePoolClientMessage } from "../src/clients/SpokePoolClient";
 import { assertPromiseError, createSpyLogger, deploySpokePoolWithToken, expect, randomAddress } from "./utils";
-
-type Block = providers.Block;
-type TransactionReceipt = providers.TransactionReceipt;
-type TransactionResponse = providers.TransactionResponse;
 
 class MockIndexedSpokePoolClient extends IndexedSpokePoolClient {
   // Override `protected` attribute.
@@ -30,18 +27,9 @@ describe("IndexedSpokePoolClient: Update", async function () {
   const makeHash = () => ethersUtils.id(randomNumber().toString());
   const makeTopic = () => ethersUtils.id(randomNumber().toString()).slice(0, 40);
 
-  // Stub getters to be used in the events. These are not used in practice.
-  const decodeError = new Error("Event decoding error");
-  const getBlock = (): Promise<Block> => Promise.resolve({} as Block);
-  const getTransaction = (): Promise<TransactionResponse> => Promise.resolve({} as TransactionResponse);
-  const getTransactionReceipt = (): Promise<TransactionReceipt> => Promise.resolve({} as TransactionReceipt);
-  const removeListener = (): void => {
-    return;
-  };
-
   let blockNumber = 100;
 
-  const generateEvent = (event: string, blockNumber: number): Event => {
+  const generateEvent = (event: string, blockNumber: number): Log => {
     return {
       blockNumber,
       transactionIndex: randomNumber(100),
@@ -54,21 +42,19 @@ describe("IndexedSpokePoolClient: Update", async function () {
       args: [] as Result,
       blockHash: makeHash(),
       event,
-      eventSignature: "",
-      decodeError,
-      getBlock,
-      getTransaction,
-      getTransactionReceipt,
-      removeListener,
     };
   };
 
   let depositId: number;
-  const getDepositEvent = (blockNumber: number): Event => {
+  const getDepositEvent = (blockNumber: number): Log => {
     const event = generateEvent("V3FundsDeposited", blockNumber);
     const args = {
+      depositor: randomAddress(),
+      recipient: randomAddress(),
       depositId: depositId++,
       inputToken: randomAddress(),
+      originChainId: 1,
+      destinationChainId: Math.ceil(Math.random() * 1e3),
       inputAmount: sdkUtils.bnOne,
       outputToken: randomAddress(),
       outputAmount: sdkUtils.bnOne,
@@ -81,7 +67,7 @@ describe("IndexedSpokePoolClient: Update", async function () {
     return { ...event, args };
   };
 
-  const getDepositRouteEvent = (blockNumber: number): Event => {
+  const getDepositRouteEvent = (blockNumber: number): Log => {
     const event = generateEvent("EnabledDepositRoute", blockNumber);
     const args = {
       originToken: randomAddress(),
@@ -95,30 +81,27 @@ describe("IndexedSpokePoolClient: Update", async function () {
   let spokePool: Contract;
   let spokePoolClient: MockIndexedSpokePoolClient;
   let currentTime: number;
-  let oldestTime: number;
 
   /**
    * postEvents() and removeEvent() emulate the indexer's corresponding functions. The indexer uses
    * process.send() to submit a message to the SpokePoolClient. In this test, the SpokePoolClient
    * instance is immediately accessible and the message handler callback is called directly.
    */
-  const postEvents = (blockNumber: number, currentTime: number, events: Event[]): void => {
-    events = sortEventsAscending(events.map(mangleEventArgs));
+  const postEvents = (blockNumber: number, currentTime: number, events: Log[]): void => {
     const message: SpokePoolClientMessage = {
       blockNumber,
       currentTime,
-      oldestTime,
       nEvents: events.length,
-      data: JSON.stringify(events, sdkUtils.jsonReplacerWithBigNumbers),
+      data: JSON.stringify(sortEventsAscending(events), sdkUtils.jsonReplacerWithBigNumbers),
     };
 
     spokePoolClient.indexerUpdate(JSON.stringify(message));
   };
 
-  const removeEvent = (event: Event): void => {
+  const removeEvent = (event: Log): void => {
     event.removed = true;
     const message: SpokePoolClientMessage = {
-      event: JSON.stringify(mangleEventArgs(event), sdkUtils.jsonReplacerWithBigNumbers),
+      event: JSON.stringify(event, sdkUtils.jsonReplacerWithBigNumbers),
     };
     spokePoolClient.indexerUpdate(JSON.stringify(message));
   };
@@ -139,11 +122,10 @@ describe("IndexedSpokePoolClient: Update", async function () {
     );
     depositId = 1;
     currentTime = Math.round(Date.now() / 1000);
-    oldestTime = currentTime - 7200;
   });
 
   it("Correctly receives and unpacks SpokePoolEventsAdded messages from indexer", async function () {
-    const events: Event[] = [];
+    const events: Log[] = [];
     for (let i = 0; i < 25; ++i) {
       events.push(getDepositEvent(blockNumber));
     }
@@ -153,7 +135,6 @@ describe("IndexedSpokePoolClient: Update", async function () {
     await spokePoolClient.update();
 
     expect(spokePoolClient.latestBlockSearched).to.equal(blockNumber);
-    expect(spokePoolClient.getOldestTime()).to.equal(oldestTime);
 
     const deposits = spokePoolClient.getDeposits();
     expect(deposits.length).to.equal(events.length);
@@ -175,7 +156,7 @@ describe("IndexedSpokePoolClient: Update", async function () {
   });
 
   it("Correctly removes pending events that are dropped before update", async function () {
-    const events: Event[] = [];
+    const events: Log[] = [];
     for (let i = 0; i < 25; ++i) {
       events.push(getDepositEvent(blockNumber++));
     }
@@ -195,7 +176,7 @@ describe("IndexedSpokePoolClient: Update", async function () {
   });
 
   it("Correctly removes pending events that are dropped after update", async function () {
-    const events: Event[] = [];
+    const events: Log[] = [];
     for (let i = 0; i < 25; ++i) {
       events.push(getDepositEvent(blockNumber++));
     }
@@ -218,7 +199,7 @@ describe("IndexedSpokePoolClient: Update", async function () {
   });
 
   it("Throws on post-ingested dropped EnabledDepositRoute events", async function () {
-    const events: Event[] = [];
+    const events: Log[] = [];
     for (let i = 0; i < 25; ++i) {
       events.push(getDepositRouteEvent(blockNumber++));
     }

@@ -1,8 +1,11 @@
 import { utils as ethersUtils } from "ethers";
+import winston from "winston";
 import { typeguards } from "@across-protocol/sdk";
 import {
   BigNumber,
   bnUint256Max,
+  CHAIN_IDs,
+  dedupArray,
   toBNWei,
   assert,
   getNetworkName,
@@ -11,6 +14,7 @@ import {
   toBN,
   replaceAddressCase,
   ethers,
+  TESTNET_CHAIN_IDs,
   TOKEN_SYMBOLS_MAP,
 } from "../utils";
 import { CommonConfig, ProcessEnv } from "../common";
@@ -24,13 +28,9 @@ type DepositConfirmationConfig = {
 
 export class RelayerConfig extends CommonConfig {
   readonly externalIndexer: boolean;
-  readonly indexerPath: string;
+  readonly listenerPath: { [chainId: number]: string } = {};
   readonly inventoryConfig: InventoryConfig;
   readonly debugProfitability: boolean;
-  // Whether token price fetch failures will be ignored when computing relay profitability.
-  // If this is false, the relayer will throw an error when fetching prices fails.
-  readonly skipRelays: boolean;
-  readonly skipRebalancing: boolean;
   readonly sendingRelaysEnabled: boolean;
   readonly sendingRebalancesEnabled: boolean;
   readonly sendingMessageRelaysEnabled: boolean;
@@ -42,6 +42,7 @@ export class RelayerConfig extends CommonConfig {
   readonly relayerGasMultiplier: BigNumber;
   readonly relayerMessageGasMultiplier: BigNumber;
   readonly minRelayerFeePct: BigNumber;
+  readonly minFillTime: { [chainId: number]: number } = {};
   readonly acceptInvalidFills: boolean;
   // List of depositors we only want to send slow fills for.
   readonly slowDepositors: string[];
@@ -49,9 +50,22 @@ export class RelayerConfig extends CommonConfig {
   readonly minDepositConfirmations: {
     [chainId: number]: DepositConfirmationConfig[];
   };
+  // The amount of runs the looping relayer will make before it logs shortfalls and unprofitable fills again. If set to the one-shot
+  // relayer, then this environment variable will do nothing.
+  readonly loggingInterval: number;
+
+  // Maintenance interval (in seconds).
+  readonly maintenanceInterval: number;
+
   // Set to false to skip querying max deposit limit from /limits Vercel API endpoint. Otherwise relayer will not
   // fill any deposit over the limit which is based on liquidReserves in the HubPool.
   readonly ignoreLimits: boolean;
+  // Set to all chain ids where the relayer should use tryMulticall over multicall on the associated spoke pool.
+  // It is up to the user to ensure that the spoke pool on the target chain has tryMulticall in its active implementation.
+  readonly tryMulticallChains: number[];
+
+  // TODO: Remove this config item once we fully move to generic chain adapters.
+  readonly useGenericAdapter: boolean;
 
   constructor(env: ProcessEnv) {
     const {
@@ -68,35 +82,34 @@ export class RelayerConfig extends CommonConfig {
       SEND_RELAYS,
       SEND_REBALANCES,
       SEND_MESSAGE_RELAYS,
-      SKIP_RELAYS,
-      SKIP_REBALANCING,
       SEND_SLOW_RELAYS,
       MIN_RELAYER_FEE_PCT,
       ACCEPT_INVALID_FILLS,
       MIN_DEPOSIT_CONFIRMATIONS,
       RELAYER_IGNORE_LIMITS,
       RELAYER_EXTERNAL_INDEXER,
-      RELAYER_SPOKEPOOL_INDEXER_PATH,
+      RELAYER_TRY_MULTICALL_CHAINS,
+      RELAYER_LOGGING_INTERVAL = "30",
+      RELAYER_MAINTENANCE_INTERVAL = "60",
     } = env;
     super(env);
 
     // External indexing is dependent on looping mode being configured.
     this.externalIndexer = this.pollingDelay > 0 && RELAYER_EXTERNAL_INDEXER === "true";
-    this.indexerPath = RELAYER_SPOKEPOOL_INDEXER_PATH ?? Constants.RELAYER_DEFAULT_SPOKEPOOL_INDEXER;
 
     // Empty means all chains.
     this.relayerOriginChains = JSON.parse(RELAYER_ORIGIN_CHAINS ?? "[]");
     this.relayerDestinationChains = JSON.parse(RELAYER_DESTINATION_CHAINS ?? "[]");
 
     // Empty means all tokens.
-    this.relayerTokens = RELAYER_TOKENS
-      ? JSON.parse(RELAYER_TOKENS).map((token) => ethers.utils.getAddress(token))
-      : [];
-    this.slowDepositors = SLOW_DEPOSITORS
-      ? JSON.parse(SLOW_DEPOSITORS).map((depositor) => ethers.utils.getAddress(depositor))
-      : [];
+    this.relayerTokens = JSON.parse(RELAYER_TOKENS ?? "[]").map((token) => ethers.utils.getAddress(token));
+    this.slowDepositors = JSON.parse(SLOW_DEPOSITORS ?? "[]").map((depositor) => ethers.utils.getAddress(depositor));
 
     this.minRelayerFeePct = toBNWei(MIN_RELAYER_FEE_PCT || Constants.RELAYER_MIN_FEE_PCT);
+
+    this.tryMulticallChains = JSON.parse(RELAYER_TRY_MULTICALL_CHAINS ?? "[]");
+    this.loggingInterval = Number(RELAYER_LOGGING_INTERVAL);
+    this.maintenanceInterval = Number(RELAYER_MAINTENANCE_INTERVAL);
 
     assert(
       !isDefined(RELAYER_EXTERNAL_INVENTORY_CONFIG) || !isDefined(RELAYER_INVENTORY_CONFIG),
@@ -232,8 +245,6 @@ export class RelayerConfig extends CommonConfig {
     this.sendingRelaysEnabled = SEND_RELAYS === "true";
     this.sendingRebalancesEnabled = SEND_REBALANCES === "true";
     this.sendingMessageRelaysEnabled = SEND_MESSAGE_RELAYS === "true";
-    this.skipRelays = SKIP_RELAYS === "true";
-    this.skipRebalancing = SKIP_REBALANCING === "true";
     this.sendingSlowRelaysEnabled = SEND_SLOW_RELAYS === "true";
     this.acceptInvalidFills = ACCEPT_INVALID_FILLS === "true";
 
@@ -244,37 +255,94 @@ export class RelayerConfig extends CommonConfig {
     // Transform deposit confirmation requirements into an array of ascending
     // deposit confirmations, sorted by the corresponding threshold in USD.
     this.minDepositConfirmations = {};
-    Object.keys(minDepositConfirmations)
-      .map((_threshold) => {
-        const threshold = Number(_threshold);
-        assert(!isNaN(threshold) && threshold >= 0, `Invalid deposit confirmation threshold (${_threshold})`);
-        return Number(threshold);
-      })
-      .sort((x, y) => x - y)
-      .forEach((usdThreshold) => {
-        const config = minDepositConfirmations[usdThreshold];
+    if (this.hubPoolChainId !== CHAIN_IDs.MAINNET && !isDefined(MIN_DEPOSIT_CONFIRMATIONS)) {
+      // Sub in permissive defaults for testnet.
+      const standardConfig = { usdThreshold: toBNWei(Number.MAX_SAFE_INTEGER), minConfirmations: 1 };
+      Object.values(TESTNET_CHAIN_IDs).forEach((chainId) => (this.minDepositConfirmations[chainId] = [standardConfig]));
+    } else {
+      Object.keys(minDepositConfirmations)
+        .map((_threshold) => {
+          const threshold = Number(_threshold);
+          assert(!isNaN(threshold) && threshold >= 0, `Invalid deposit confirmation threshold (${_threshold})`);
+          return threshold;
+        })
+        .sort((x, y) => x - y)
+        .forEach((usdThreshold) => {
+          const config = minDepositConfirmations[usdThreshold];
 
-        Object.entries(config).forEach(([chainId, _minConfirmations]) => {
-          const minConfirmations = Number(_minConfirmations);
-          assert(
-            !isNaN(minConfirmations) && minConfirmations >= 0,
-            `${getNetworkName(chainId)} deposit confirmations for` +
-              ` ${usdThreshold} threshold missing or invalid (${_minConfirmations}).`
-          );
+          Object.entries(config).forEach(([chainId, _minConfirmations]) => {
+            const minConfirmations = Number(_minConfirmations);
+            assert(
+              !isNaN(minConfirmations) && minConfirmations >= 0,
+              `${getNetworkName(chainId)} deposit confirmations for` +
+                ` ${usdThreshold} threshold missing or invalid (${_minConfirmations}).`
+            );
 
-          this.minDepositConfirmations[chainId] ??= [];
-          this.minDepositConfirmations[chainId].push({ usdThreshold: toBNWei(usdThreshold), minConfirmations });
+            this.minDepositConfirmations[chainId] ??= [];
+            this.minDepositConfirmations[chainId].push({ usdThreshold: toBNWei(usdThreshold), minConfirmations });
+          });
         });
+
+      // Ensure that there is always a deposit confirmation config for the maximum theoretical value of a fill.
+      Object.values(this.minDepositConfirmations).forEach((depositConfirmations) => {
+        const { usdThreshold: maxThreshold, minConfirmations: maxConfirmations } = depositConfirmations.at(-1);
+        if (maxThreshold.lt(bnUint256Max)) {
+          depositConfirmations.push({
+            usdThreshold: bnUint256Max,
+            minConfirmations: maxConfirmations + 1,
+          });
+        }
       });
 
-    // Append default thresholds as a safe upper-bound.
-    Object.keys(this.minDepositConfirmations).forEach((chainId) =>
-      this.minDepositConfirmations[chainId].push({
-        usdThreshold: bnUint256Max,
-        minConfirmations: Number.MAX_SAFE_INTEGER,
-      })
-    );
+      // Verify that each successive USD threshold has an increasing deposit confirmation config.
+      Object.values(this.minDepositConfirmations).forEach((chainMDC) => {
+        chainMDC.slice(1).forEach(({ usdThreshold, minConfirmations: mdc }, idx) => {
+          const usdFormatted = ethersUtils.formatEther(usdThreshold);
+          const prevMDC = chainMDC[idx].minConfirmations;
+          assert(
+            mdc >= prevMDC,
+            `Non-incrementing deposit confirmation specified for USD threshold ${usdFormatted} (${prevMDC} > ${mdc})`
+          );
+        });
+      });
+    }
 
     this.ignoreLimits = RELAYER_IGNORE_LIMITS === "true";
+  }
+
+  /**
+   * @notice Loads additional configuration state that can only be known after we know all chains that we're going to
+   * support. Warns or throws if any of the configurations are not valid.
+   * @param chainIdIndices All expected chain ID's that could be supported by this config.
+   * @param logger Optional logger object.
+   */
+  override validate(chainIds: number[], logger: winston.Logger): void {
+    const { listenerPath, minFillTime, relayerOriginChains, relayerDestinationChains } = this;
+    const relayerChainIds =
+      relayerOriginChains.length > 0 && relayerDestinationChains.length > 0
+        ? dedupArray([...relayerOriginChains, ...relayerDestinationChains])
+        : chainIds;
+
+    const ignoredChainIds = chainIds.filter(
+      (chainId) => !relayerChainIds.includes(chainId) && chainId !== CHAIN_IDs.BOBA
+    );
+    if (ignoredChainIds.length > 0 && logger) {
+      logger.debug({
+        at: "RelayerConfig::validate",
+        message: `Ignoring ${ignoredChainIds.length} chains.`,
+        ignoredChainIds,
+      });
+    }
+
+    const { RELAYER_SPOKEPOOL_INDEXER_PATH = Constants.RELAYER_DEFAULT_SPOKEPOOL_INDEXER } = process.env;
+
+    chainIds.forEach((chainId) => {
+      minFillTime[chainId] = Number(process.env[`RELAYER_MIN_FILL_TIME_${chainId}`] ?? 0);
+      listenerPath[chainId] =
+        process.env[`RELAYER_SPOKEPOOL_INDEXER_PATH_${chainId}`] ?? RELAYER_SPOKEPOOL_INDEXER_PATH;
+    });
+
+    // Only validate config for chains that the relayer cares about.
+    super.validate(relayerChainIds, logger);
   }
 }

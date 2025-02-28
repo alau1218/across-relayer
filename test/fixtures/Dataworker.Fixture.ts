@@ -27,10 +27,13 @@ import {
 
 import { Dataworker } from "../../src/dataworker/Dataworker"; // Tested
 import { BundleDataClient, TokenClient } from "../../src/clients";
+import { DataworkerConfig } from "../../src/dataworker/DataworkerConfig";
 import { DataworkerClients } from "../../src/dataworker/DataworkerClientHelper";
 import { MockConfigStoreClient, MockedMultiCallerClient } from "../mocks";
 import { EthersTestLibrary } from "../types";
 import { clients as sdkClients } from "@across-protocol/sdk";
+
+export { DataworkerConfig } from "../../src/dataworker/DataworkerConfig";
 
 async function _constructSpokePoolClientsWithLookback(
   spokePools: Contract[],
@@ -54,7 +57,7 @@ async function _constructSpokePoolClientsWithLookback(
     );
   });
 }
-// Sets up all contracts neccessary to build and execute leaves in dataworker merkle roots: relayer refund, slow relay,
+// Sets up all contracts necessary to build and execute leaves in dataworker merkle roots: relayer refund, slow relay,
 // and pool rebalance roots.
 export async function setupDataworker(
   ethers: EthersTestLibrary,
@@ -69,6 +72,7 @@ export async function setupDataworker(
   spokePool_1: Contract;
   erc20_1: Contract;
   spokePool_2: Contract;
+  spokePool_4: Contract;
   erc20_2: Contract;
   l1Token_1: Contract;
   l1Token_2: Contract;
@@ -127,7 +131,7 @@ export async function setupDataworker(
   // Enable deposit routes for second L2 tokens so relays can be sent between spoke pool 1 <--> 2.
   await enableRoutes(spokePool_1, [{ originToken: erc20_2.address, destinationChainId: destinationChainId }]);
   await enableRoutes(spokePool_2, [{ originToken: erc20_1.address, destinationChainId: originChainId }]);
-
+  await enableRoutes(spokePool_4, [{ originToken: l1Token_1.address, destinationChainId: destinationChainId }]);
   // For each chain, enable routes to both erc20's so that we can fill relays
   await enableRoutesOnHubPool(hubPool, [
     { destinationChainId: originChainId, l1Token: l1Token_1, destinationToken: erc20_1 },
@@ -228,6 +232,7 @@ export async function setupDataworker(
   };
   const dataworkerInstance = new Dataworker(
     spyLogger,
+    {} as DataworkerConfig,
     dataworkerClients,
     testChainIdList,
     maxRefundPerRelayerRefundLeaf,
@@ -245,7 +250,7 @@ export async function setupDataworker(
   // Give depositors the tokens they'll deposit into spoke pools:
   await setupTokensForWallet(spokePool_1, depositor, [erc20_1, erc20_2], undefined, 10);
   await setupTokensForWallet(spokePool_2, depositor, [erc20_2, erc20_1], undefined, 10);
-
+  await setupTokensForWallet(spokePool_4, depositor, [l1Token_1], undefined, 10);
   // Give relayers the tokens they'll need to relay on spoke pools:
   await setupTokensForWallet(spokePool_1, relayer, [erc20_1, erc20_2, l1Token_1, l1Token_2], undefined, 10);
   await setupTokensForWallet(spokePool_2, relayer, [erc20_1, erc20_2, l1Token_1, l1Token_2], undefined, 10);
@@ -254,12 +259,14 @@ export async function setupDataworker(
   // "reasonable" block number based off the block time when looking at quote timestamps.
   await spokePool_1.setCurrentTime(await getLastBlockTime(spokePool_1.provider));
   await spokePool_2.setCurrentTime(await getLastBlockTime(spokePool_2.provider));
+  await spokePool_4.setCurrentTime(await getLastBlockTime(spokePool_4.provider));
 
   return {
     hubPool,
     spokePool_1,
     erc20_1,
     spokePool_2,
+    spokePool_4,
     erc20_2,
     l1Token_1,
     l1Token_2,

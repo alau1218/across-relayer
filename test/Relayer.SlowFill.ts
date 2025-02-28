@@ -30,7 +30,6 @@ import {
   ethers,
   expect,
   getLastBlockTime,
-  getRelayDataHash,
   lastSpyLogIncludes,
   setupTokensForWallet,
   sinon,
@@ -53,6 +52,7 @@ describe("Relayer: Initiates slow fill requests", async function () {
   let spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let configStoreClient: ConfigStoreClient, hubPoolClient: HubPoolClient, tokenClient: TokenClient;
   let relayerInstance: Relayer, mockCrossChainTransferClient: MockCrossChainTransferClient;
+  let tryMulticallClient: MultiCallerClient;
   let multiCallerClient: MultiCallerClient, profitClient: MockProfitClient, mockInventoryClient: MockInventoryClient;
 
   const updateAllClients = async () => {
@@ -106,6 +106,7 @@ describe("Relayer: Initiates slow fill requests", async function () {
     await hubPoolClient.update();
 
     multiCallerClient = new MockedMultiCallerClient(spyLogger); // leave out the gasEstimator for now.
+    tryMulticallClient = new MockedMultiCallerClient(spyLogger);
 
     spokePoolClient_1 = new SpokePoolClient(
       spyLogger,
@@ -154,11 +155,14 @@ describe("Relayer: Initiates slow fill requests", async function () {
         multiCallerClient,
         inventoryClient: mockInventoryClient,
         acrossApiClient: new AcrossApiClient(spyLogger, hubPoolClient, chainIds),
+        tryMulticallClient,
       },
       {
         relayerTokens: [],
         slowDepositors: [],
         minDepositConfirmations: defaultMinDepositConfirmations,
+        tryMulticallChains: [],
+        loggingInterval: -1,
       } as unknown as RelayerConfig
     );
 
@@ -210,19 +214,14 @@ describe("Relayer: Initiates slow fill requests", async function () {
     expect(txnHashes.length).to.equal(1);
     const txn = await spokePool_1.provider.getTransaction(txnHashes[0]);
     const { name: method } = spokePool_1.interface.parseTransaction(txn);
-    expect(method).to.equal("requestV3SlowFill");
+    expect(method).to.equal("requestSlowFill");
     expect(spyLogIncludes(spy, -5, "Insufficient balance to fill all deposits")).to.be.true;
     expect(lastSpyLogIncludes(spy, "Requested slow fill for deposit.")).to.be.true;
 
     // Verify that the slowFill request was received by the destination SpokePoolClient.
     await Promise.all([spokePoolClient_1.update(), spokePoolClient_2.update(), hubPoolClient.update()]);
-    let slowFillRequest = spokePoolClient_2.getSlowFillRequest(deposit);
+    const slowFillRequest = spokePoolClient_2.getSlowFillRequest(deposit);
     expect(slowFillRequest).to.exist;
-    slowFillRequest = slowFillRequest!; // tsc coersion
-
-    expect(getRelayDataHash(slowFillRequest, slowFillRequest.destinationChainId)).to.equal(
-      getRelayDataHash(deposit, deposit.destinationChainId)
-    );
 
     const txnReceipts = await relayerInstance.checkForUnfilledDepositsAndFill();
     for (const receipts of Object.values(txnReceipts)) {

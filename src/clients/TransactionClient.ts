@@ -11,6 +11,7 @@ import {
   TransactionResponse,
   TransactionSimulationResult,
   willSucceed,
+  stringifyThrownValue,
 } from "../utils";
 
 export interface AugmentedTransaction {
@@ -28,6 +29,9 @@ export interface AugmentedTransaction {
   canFailInSimulation?: boolean;
   // Optional batch ID to use to group transactions
   groupId?: string;
+  // If true, the transaction is being sent to a non Multicall contract so we can't batch it together
+  // with other transactions.
+  nonMulticall?: boolean;
 }
 
 const { fixedPointAdjustment: fixedPoint } = sdkUtils;
@@ -36,6 +40,8 @@ const { isError } = typeguards;
 const DEFAULT_GASLIMIT_MULTIPLIER = 1.0;
 
 export class TransactionClient {
+  readonly nonces: { [chainId: number]: number } = {};
+
   // eslint-disable-next-line no-useless-constructor
   constructor(readonly logger: winston.Logger) {}
 
@@ -49,7 +55,7 @@ export class TransactionClient {
     return Promise.all(txns.map((txn: AugmentedTransaction) => this._simulate(txn)));
   }
 
-  protected async _submit(txn: AugmentedTransaction, nonce: number | null = null): Promise<TransactionResponse> {
+  protected _submit(txn: AugmentedTransaction, nonce: number | null = null): Promise<TransactionResponse> {
     const { contract, method, args, value, gasLimit } = txn;
     return runTransaction(this.logger, contract, method, args, value, gasLimit, nonce);
   }
@@ -66,7 +72,6 @@ export class TransactionClient {
     // Transactions are submitted sequentially to avoid nonce collisions. More
     // advanced nonce management may permit them to be submitted in parallel.
     let mrkdwn = "";
-    let nonce: number | null = null;
     for (let idx = 0; idx < txns.length; ++idx) {
       const txn = txns[idx];
 
@@ -74,9 +79,7 @@ export class TransactionClient {
         throw new Error(`chainId mismatch for method ${txn.method} (${txn.chainId} !== ${chainId})`);
       }
 
-      if (nonce !== null) {
-        this.logger.debug({ at: "TransactionClient#submit", message: `Using nonce ${nonce}.` });
-      }
+      const nonce = this.nonces[chainId] ? this.nonces[chainId] + 1 : undefined;
 
       // @dev It's assumed that nobody ever wants to discount the gasLimit.
       const gasLimitMultiplier = txn.gasLimitMultiplier ?? DEFAULT_GASLIMIT_MULTIPLIER;
@@ -94,19 +97,20 @@ export class TransactionClient {
       try {
         response = await this._submit(txn, nonce);
       } catch (error) {
+        delete this.nonces[chainId];
         this.logger.info({
           at: "TransactionClient#submit",
           message: `Transaction ${idx + 1} submission on ${networkName} failed or timed out.`,
           mrkdwn,
           // @dev `error` _sometimes_ doesn't decode correctly (especially on Polygon), so fish for the reason.
           errorMessage: isError(error) ? (error as Error).message : undefined,
-          error,
+          error: stringifyThrownValue(error),
           notificationPath: "across-error",
         });
         return txnResponses;
       }
 
-      nonce = response.nonce + 1;
+      this.nonces[chainId] = response.nonce;
       const blockExplorer = blockExplorerLink(response.hash, txn.chainId);
       mrkdwn += `  ${idx + 1}. ${txn.message || "No message"} (${blockExplorer}): ${txn.mrkdwn || "No markdown"}\n`;
       txnResponses.push(response);

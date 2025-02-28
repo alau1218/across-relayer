@@ -4,6 +4,7 @@ import {
   bnZero,
   winston,
   BigNumber,
+  dedupArray,
   getCurrentTime,
   TOKEN_SYMBOLS_MAP,
   CHAIN_IDs,
@@ -17,6 +18,10 @@ export interface DepositLimits {
 }
 
 const API_UPDATE_RETENTION_TIME = 60; // seconds
+
+export function getAcrossHost(hubChainId: number): string {
+  return process.env.ACROSS_API_HOST ?? (hubChainId === CHAIN_IDs.MAINNET ? "app.across.to" : "testnet.across.to");
+}
 
 export class AcrossApiClient {
   private endpoint: string;
@@ -35,9 +40,9 @@ export class AcrossApiClient {
     readonly timeout: number = 3000
   ) {
     const hubChainId = hubPoolClient.chainId;
-    this.endpoint = `https://${hubChainId === CHAIN_IDs.MAINNET ? "app.across.to" : "testnet.across.to"}/api`;
+    this.endpoint = `https://${getAcrossHost(hubChainId)}/api`;
     if (Object.keys(tokensQuery).length === 0) {
-      this.tokensQuery = Object.values(TOKEN_SYMBOLS_MAP).map(({ addresses }) => addresses[hubChainId]);
+      this.tokensQuery = dedupArray(Object.values(TOKEN_SYMBOLS_MAP).map(({ addresses }) => addresses[hubChainId]));
     }
 
     this.chainIds = chainIds.filter((chainId) => chainId !== hubChainId);

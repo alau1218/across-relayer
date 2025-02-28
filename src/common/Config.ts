@@ -1,4 +1,5 @@
-import { DEFAULT_MULTICALL_CHUNK_SIZE, DEFAULT_CHAIN_MULTICALL_CHUNK_SIZE, DEFAULT_ARWEAVE_GATEWAY } from "../common";
+import winston from "winston";
+import { DEFAULT_MULTICALL_CHUNK_SIZE, DEFAULT_ARWEAVE_GATEWAY } from "../common";
 import { ArweaveGatewayInterface, ArweaveGatewayInterfaceSS } from "../interfaces";
 import { assert, CHAIN_IDs, ethers, isDefined } from "../utils";
 import * as Constants from "./Constants";
@@ -10,7 +11,7 @@ export interface ProcessEnv {
 export class CommonConfig {
   readonly hubPoolChainId: number;
   readonly pollingDelay: number;
-  readonly ignoredAddresses: string[];
+  readonly ignoredAddresses: Set<string>;
   readonly maxBlockLookBack: { [key: number]: number };
   readonly maxTxWait: number;
   readonly spokePoolChainsOverride: number[];
@@ -34,7 +35,6 @@ export class CommonConfig {
       HUB_CHAIN_ID,
       POLLING_DELAY,
       MAX_BLOCK_LOOK_BACK,
-      MAX_TX_WAIT_DURATION,
       SEND_TRANSACTIONS,
       SPOKE_POOL_CHAINS_OVERRIDE,
       ACROSS_BOT_VERSION,
@@ -43,7 +43,20 @@ export class CommonConfig {
       ARWEAVE_GATEWAY,
     } = env;
 
+    const mergeConfig = <T>(config: T, envVar: string): T => {
+      const shallowCopy = { ...config };
+      Object.entries(JSON.parse(envVar ?? "{}")).forEach(([k, v]) => {
+        assert(
+          typeof v === typeof shallowCopy[k] || !isDefined(shallowCopy[k]),
+          `Invalid ${envVar} configuration on key ${k} (${typeof v} != ${typeof shallowCopy[k]})`
+        );
+        shallowCopy[k] = v;
+      });
+      return shallowCopy;
+    };
+
     this.version = ACROSS_BOT_VERSION ?? "unknown";
+    this.hubPoolChainId = Number(HUB_CHAIN_ID ?? CHAIN_IDs.MAINNET);
 
     this.timeToCache = Number(HUB_POOL_TIME_TO_CACHE ?? 60 * 60); // 1 hour by default.
     if (Number.isNaN(this.timeToCache) || this.timeToCache < 0) {
@@ -56,22 +69,18 @@ export class CommonConfig {
     this.maxConfigVersion = Number(ACROSS_MAX_CONFIG_VERSION ?? Constants.CONFIG_STORE_VERSION);
     assert(!isNaN(this.maxConfigVersion), `Invalid maximum config version: ${this.maxConfigVersion}`);
 
-    this.blockRangeEndBlockBuffer = BLOCK_RANGE_END_BLOCK_BUFFER
-      ? JSON.parse(BLOCK_RANGE_END_BLOCK_BUFFER)
-      : Constants.BUNDLE_END_BLOCK_BUFFERS;
+    this.blockRangeEndBlockBuffer = mergeConfig(Constants.BUNDLE_END_BLOCK_BUFFERS, BLOCK_RANGE_END_BLOCK_BUFFER);
 
-    this.ignoredAddresses = JSON.parse(IGNORED_ADDRESSES ?? "[]").map((address) => ethers.utils.getAddress(address));
+    this.ignoredAddresses = new Set(JSON.parse(IGNORED_ADDRESSES ?? "[]").map(ethers.utils.getAddress));
 
     // `maxRelayerLookBack` is how far we fetch events from, modifying the search config's 'fromBlock'
     this.maxRelayerLookBack = Number(MAX_RELAYER_DEPOSIT_LOOK_BACK ?? Constants.MAX_RELAYER_DEPOSIT_LOOK_BACK);
-    this.hubPoolChainId = Number(HUB_CHAIN_ID ?? CHAIN_IDs.MAINNET);
     this.pollingDelay = Number(POLLING_DELAY ?? 60);
-    this.spokePoolChainsOverride = SPOKE_POOL_CHAINS_OVERRIDE ? JSON.parse(SPOKE_POOL_CHAINS_OVERRIDE) : [];
-    this.maxBlockLookBack = MAX_BLOCK_LOOK_BACK ? JSON.parse(MAX_BLOCK_LOOK_BACK) : {};
-    if (Object.keys(this.maxBlockLookBack).length === 0) {
-      this.maxBlockLookBack = Constants.CHAIN_MAX_BLOCK_LOOKBACK;
-    }
-    this.maxTxWait = Number(MAX_TX_WAIT_DURATION ?? 180); // 3 minutes
+    this.spokePoolChainsOverride = JSON.parse(SPOKE_POOL_CHAINS_OVERRIDE ?? "[]");
+
+    // Inherit the default eth_getLogs block range config, then sub in any env-based overrides.
+    this.maxBlockLookBack = mergeConfig(Constants.CHAIN_MAX_BLOCK_LOOKBACK, MAX_BLOCK_LOOK_BACK);
+
     this.sendingTransactionsEnabled = SEND_TRANSACTIONS === "true";
 
     // Load the Arweave gateway from the environment.
@@ -90,38 +99,38 @@ export class CommonConfig {
    * @throws If overridden TO_BLOCK_OVERRIDE_${chainId} isn't greater than 0
    * @param chainIdIndices All expected chain ID's that could be supported by this config.
    */
-  loadAndValidateConfigForChains(chainIdIndices: number[]): void {
-    for (const chainId of chainIdIndices) {
-      // Validate that there is a block range end block buffer for each chain.
-      if (Object.keys(this.blockRangeEndBlockBuffer).length > 0) {
-        assert(
-          Object.keys(this.blockRangeEndBlockBuffer).includes(chainId.toString()),
-          `BLOCK_RANGE_END_BLOCK_BUFFER is missing chainId ${chainId}`
-        );
+  validate(chainIds: number[], logger: winston.Logger): void {
+    // Warn about any missing MAX_BLOCK_LOOK_BACK config.
+    const lookbackKeys = Object.keys(this.maxBlockLookBack).map(Number);
+    if (lookbackKeys.length > 0) {
+      const missing = chainIds.find((chainId) => !lookbackKeys.includes(chainId));
+      if (missing) {
+        const message = `Missing MAX_BLOCK_LOOK_BACK configuration for chainId ${missing}`;
+        logger.warn({ at: "RelayerConfig::validate", message });
+        this.maxBlockLookBack[missing] = 5000; // Revert to a safe default.
       }
+    }
 
-      // Validate that there is a max block look back for each chain.
-      if (Object.keys(this.maxBlockLookBack).length > 0) {
-        assert(
-          Object.keys(this.maxBlockLookBack).includes(chainId.toString()),
-          `MAX_BLOCK_LOOK_BACK is missing chainId ${chainId}`
-        );
-      }
+    // BLOCK_RANGE_END_BLOCK_BUFFER is important for the dataworker, so assert on it.
+    const bufferKeys = Object.keys(this.blockRangeEndBlockBuffer).map(Number);
+    if (bufferKeys.length > 0) {
+      const missing = chainIds.find((chainId) => !bufferKeys.includes(chainId));
+      assert(!missing, `Missing BLOCK_RANGE_END_BLOCK_BUFFER configuration for chainId ${missing}`);
+    }
 
+    for (const chainId of chainIds) {
       // Multicall chunk size precedence: Environment, chain-specific config, global default.
       // prettier-ignore
       const chunkSize = Number(
-      process.env[`MULTICALL_CHUNK_SIZE_CHAIN_${chainId}`]
+        process.env[`MULTICALL_CHUNK_SIZE_CHAIN_${chainId}`]
         ?? process.env.MULTICALL_CHUNK_SIZE
-        ?? DEFAULT_CHAIN_MULTICALL_CHUNK_SIZE[chainId]
-        ?? DEFAULT_MULTICALL_CHUNK_SIZE
-      );
+      ) || DEFAULT_MULTICALL_CHUNK_SIZE;
       assert(chunkSize > 0, `Chain ${chainId} multicall chunk size (${chunkSize}) must be greater than 0`);
       this.multiCallChunkSize[chainId] = chunkSize;
 
       // Load any toBlock overrides.
-      if (process.env[`TO_BLOCK_OVERRIDE_${chainId}`] !== undefined) {
-        const toBlock = Number(process.env[`TO_BLOCK_OVERRIDE_${chainId}`]);
+      const toBlock = Number(process.env[`TO_BLOCK_OVERRIDE_${chainId}`]) || undefined;
+      if (isDefined(toBlock)) {
         assert(toBlock > 0, `TO_BLOCK_OVERRIDE_${chainId} must be greater than 0`);
         this.toBlockOverride[chainId] = toBlock;
       }

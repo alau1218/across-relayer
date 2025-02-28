@@ -53,7 +53,7 @@ describe("Relayer: Unfilled Deposits", async function () {
   let spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let configStoreClient: MockConfigStoreClient, hubPoolClient: HubPoolClient;
   let spokePoolClients: Record<number, SpokePoolClient>;
-  let multiCallerClient: MultiCallerClient, tokenClient: TokenClient;
+  let multiCallerClient: MultiCallerClient, tryMulticallClient: MultiCallerClient, tokenClient: TokenClient;
   let profitClient: MockProfitClient;
   let spokePool1DeploymentBlock: number, spokePool2DeploymentBlock: number;
 
@@ -119,6 +119,7 @@ describe("Relayer: Unfilled Deposits", async function () {
 
     spokePoolClients = { [originChainId]: spokePoolClient_1, [destinationChainId]: spokePoolClient_2 };
     multiCallerClient = new MockedMultiCallerClient(spyLogger);
+    tryMulticallClient = new MockedMultiCallerClient(spyLogger);
     tokenClient = new TokenClient(spyLogger, relayer.address, spokePoolClients, hubPoolClient);
     profitClient = new MockProfitClient(spyLogger, hubPoolClient, spokePoolClients, []);
     await profitClient.initToken(l1Token);
@@ -136,11 +137,13 @@ describe("Relayer: Unfilled Deposits", async function () {
         multiCallerClient,
         inventoryClient: new MockInventoryClient(null, null, null, null, null, hubPoolClient),
         acrossApiClient: new AcrossApiClient(spyLogger, hubPoolClient, chainIds),
+        tryMulticallClient,
       },
       {
         relayerTokens: [],
         minDepositConfirmations: defaultMinDepositConfirmations,
         acceptInvalidFills: false,
+        tryMulticallChains: [],
       } as unknown as RelayerConfig
     );
 
@@ -255,7 +258,7 @@ describe("Relayer: Unfilled Deposits", async function () {
     // Make an invalid fills by tweaking outputAmount and depositId, respectively.
     const fakeDeposit = { ...deposit, outputAmount: deposit.outputAmount.sub(bnOne) };
     const invalidFill = await fillV3Relay(spokePool_2, fakeDeposit, relayer);
-    const wrongDepositId = { ...deposit, depositId: deposit.depositId + 1 };
+    const wrongDepositId = { ...deposit, depositId: deposit.depositId.add(1) };
     await fillV3Relay(spokePool_2, wrongDepositId, relayer);
 
     // The deposit should show up as unfilled, since the fill was incorrectly applied to the wrong deposit.
@@ -265,9 +268,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       .excludingEvery(["realizedLpFeePct", "quoteBlockNumber", "fromLiteChain", "toLiteChain"])
       .to.deep.equal([
         {
-          deposit,
+          deposit: {
+            ...deposit,
+            depositId: sdkUtils.toBN(deposit.depositId),
+          },
           unfilledAmount: deposit.outputAmount,
-          invalidFills: [invalidFill],
+          invalidFills: [
+            {
+              ...invalidFill,
+              depositId: sdkUtils.toBN(invalidFill.depositId),
+            },
+          ],
           version: configStoreClient.configStoreVersion,
         },
       ]);
@@ -309,17 +320,17 @@ describe("Relayer: Unfilled Deposits", async function () {
         deposit.depositId,
         originChainId,
         updatedOutputAmount,
-        deposit.recipient,
+        sdkUtils.toBytes32(deposit.recipient),
         deposit.message
       );
 
       await spokePool_1
         .connect(depositor)
-        .speedUpV3Deposit(
-          depositor.address,
+        .speedUpDeposit(
+          sdkUtils.toBytes32(depositor.address),
           deposit.depositId,
           updatedOutputAmount,
-          deposit.recipient,
+          sdkUtils.toBytes32(deposit.recipient),
           deposit.message,
           signature
         );
@@ -355,10 +366,6 @@ describe("Relayer: Unfilled Deposits", async function () {
     await updateAllClients();
     unfilledDeposits = _getAllUnfilledDeposits();
     expect(unfilledDeposits.length).to.equal(1);
-    expect(sdkUtils.getRelayDataHash(unfilledDeposits[0].deposit, destinationChainId)).to.equal(
-      sdkUtils.getRelayDataHash(deposit, deposit.destinationChainId)
-    );
-
     await fillV3Relay(spokePool_2, deposit, relayer);
 
     await updateAllClients();
@@ -372,17 +379,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       deposit.depositId,
       originChainId,
       updatedOutputAmount,
-      deposit.recipient,
+      sdkUtils.toBytes32(deposit.recipient),
       deposit.message
     );
 
     await spokePool_1
       .connect(depositor)
-      .speedUpV3Deposit(
-        depositor.address,
+      .speedUpDeposit(
+        sdkUtils.toBytes32(depositor.address),
         deposit.depositId,
         updatedOutputAmount,
-        deposit.recipient,
+        sdkUtils.toBytes32(deposit.recipient),
         deposit.message,
         signature
       );
@@ -509,9 +516,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       .excludingEvery(["realizedLpFeePct", "quoteBlockNumber", "fromLiteChain", "toLiteChain"])
       .to.deep.equal([
         {
-          deposit,
+          deposit: {
+            ...deposit,
+            depositId: sdkUtils.toBN(deposit.depositId),
+          },
           unfilledAmount: deposit.outputAmount,
-          invalidFills: [invalidFill],
+          invalidFills: [
+            {
+              ...invalidFill,
+              depositId: sdkUtils.toBN(invalidFill.depositId),
+            },
+          ],
           version: configStoreClient.configStoreVersion,
         },
       ]);

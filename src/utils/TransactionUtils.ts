@@ -2,13 +2,12 @@ import { gasPriceOracle, typeguards, utils as sdkUtils } from "@across-protocol/
 import { FeeData } from "@ethersproject/abstract-provider";
 import dotenv from "dotenv";
 import { AugmentedTransaction } from "../clients";
-import { DEFAULT_GAS_FEE_SCALERS, multicall3Addresses } from "../common";
+import { DEFAULT_GAS_FEE_SCALERS } from "../common";
 import { EthersError } from "../interfaces";
 import {
   BigNumber,
   bnZero,
   Contract,
-  fixedPointAdjustment as fixedPoint,
   isDefined,
   TransactionResponse,
   ethers,
@@ -16,6 +15,7 @@ import {
   Signer,
   toBNWei,
   winston,
+  stringifyThrownValue,
 } from "../utils";
 dotenv.config();
 
@@ -23,9 +23,17 @@ export type TransactionSimulationResult = {
   transaction: AugmentedTransaction;
   succeed: boolean;
   reason?: string;
+  data?: any;
 };
 
 const { isError, isEthersError } = typeguards;
+
+export type Multicall2Call = {
+  callData: ethers.utils.BytesLike;
+  target: string;
+};
+
+const nonceReset: { [chainId: number]: boolean } = {};
 
 const txnRetryErrors = new Set(["INSUFFICIENT_FUNDS", "NONCE_EXPIRED", "REPLACEMENT_UNDERPRICED"]);
 const expectedRpcErrorMessages = new Set(["nonce has already been used", "intrinsic gas too low"]);
@@ -42,10 +50,7 @@ export function getNetworkError(err: unknown): string {
 }
 
 export async function getMultisender(chainId: number, baseSigner: Signer): Promise<Contract | undefined> {
-  if (!multicall3Addresses[chainId] || !baseSigner) {
-    return undefined;
-  }
-  return new Contract(multicall3Addresses[chainId], await sdkUtils.getABI("Multicall3"), baseSigner);
+  return sdkUtils.getMulticall3(chainId, baseSigner);
 }
 
 // Note that this function will throw if the call to the contract on method for given args reverts. Implementers
@@ -58,9 +63,15 @@ export async function runTransaction(
   value = bnZero,
   gasLimit: BigNumber | null = null,
   nonce: number | null = null,
-  retriesRemaining = 2
+  retriesRemaining = 1
 ): Promise<TransactionResponse> {
-  const chainId = (await contract.provider.getNetwork()).chainId;
+  const { provider } = contract;
+  const { chainId } = await provider.getNetwork();
+
+  if (!nonceReset[chainId]) {
+    nonce = await provider.getTransactionCount(await contract.signer.getAddress());
+    nonceReset[chainId] = true;
+  }
 
   try {
     const priorityFeeScaler =
@@ -70,7 +81,12 @@ export async function runTransaction(
       Number(process.env[`MAX_FEE_PER_GAS_SCALER_${chainId}`] || process.env.MAX_FEE_PER_GAS_SCALER) ||
       DEFAULT_GAS_FEE_SCALERS[chainId]?.maxFeePerGasScaler;
 
-    const gas = await getGasPrice(contract.provider, priorityFeeScaler, maxFeePerGasScaler);
+    const gas = await getGasPrice(
+      provider,
+      priorityFeeScaler,
+      maxFeePerGasScaler,
+      await contract.populateTransaction[method](...(args as Array<unknown>), { value })
+    );
 
     logger.debug({
       at: "TxUtil",
@@ -98,7 +114,7 @@ export async function runTransaction(
       logger.debug({
         at: "TxUtil#runTransaction",
         message: "Retrying txn due to expected error",
-        error: JSON.stringify(error),
+        error: stringifyThrownValue(error),
         retriesRemaining,
       });
 
@@ -134,7 +150,7 @@ export async function runTransaction(
       } else {
         logger[txnRetryable(error) ? "warn" : "error"]({
           ...commonFields,
-          error: JSON.stringify(error),
+          error: stringifyThrownValue(error),
         });
       }
       throw error;
@@ -142,30 +158,30 @@ export async function runTransaction(
   }
 }
 
-// TODO: add in gasPrice when the SDK has this for the given chainId. TODO: improve how we fetch prices.
-// For now this method will extract the provider's Fee data from the associated network and scale it by a priority
-// scaler. This works on both mainnet and L2's by the utility switching the response structure accordingly.
 export async function getGasPrice(
   provider: ethers.providers.Provider,
   priorityScaler = 1.2,
-  maxFeePerGasScaler = 3
+  maxFeePerGasScaler = 3,
+  transactionObject?: ethers.PopulatedTransaction
 ): Promise<Partial<FeeData>> {
+  // Floor scalers at 1.0 as we'll rarely want to submit too low of a gas price. We mostly
+  // just want to submit with as close to prevailing fees as possible.
+  maxFeePerGasScaler = Math.max(1, maxFeePerGasScaler);
+  priorityScaler = Math.max(1, priorityScaler);
   const { chainId } = await provider.getNetwork();
-  const feeData = await gasPriceOracle.getGasPriceEstimate(provider, chainId);
+  // Pass in unsignedTx here for better Linea gas price estimations via the Linea Viem provider.
+  const feeData = await gasPriceOracle.getGasPriceEstimate(provider, {
+    chainId,
+    baseFeeMultiplier: toBNWei(maxFeePerGasScaler),
+    priorityFeeMultiplier: toBNWei(priorityScaler),
+    unsignedTx: transactionObject,
+  });
 
-  if (feeData.maxPriorityFeePerGas.gt(feeData.maxFeePerGas)) {
-    feeData.maxFeePerGas = scaleByNumber(feeData.maxPriorityFeePerGas, 1.5);
-  }
-
-  // Handle chains with legacy pricing.
-  if (feeData.maxPriorityFeePerGas.eq(bnZero)) {
-    return { gasPrice: scaleByNumber(feeData.maxFeePerGas, priorityScaler) };
-  }
-
-  // Default to EIP-1559 (type 2) pricing.
+  // Default to EIP-1559 (type 2) pricing. If gasPriceOracle is using a legacy adapter for this chain then
+  // the priority fee will be 0.
   return {
-    maxFeePerGas: scaleByNumber(feeData.maxFeePerGas, Math.max(priorityScaler * maxFeePerGasScaler, 1)),
-    maxPriorityFeePerGas: scaleByNumber(feeData.maxPriorityFeePerGas, priorityScaler),
+    maxFeePerGas: feeData.maxFeePerGas,
+    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
   };
 }
 
@@ -182,8 +198,9 @@ export async function willSucceed(transaction: AugmentedTransaction): Promise<Tr
   // This is useful for surfacing custom error revert reasons like RelayFilled in the V3 SpokePool but
   // it does incur an extra RPC call. We do this because estimateGas is a provider function that doesn't
   // relay custom errors well: https://github.com/ethers-io/ethers.js/discussions/3291#discussion-4314795
+  let data;
   try {
-    await contract.callStatic[method](...args);
+    data = await contract.callStatic[method](...args);
   } catch (err: any) {
     if (err.errorName) {
       return {
@@ -196,7 +213,7 @@ export async function willSucceed(transaction: AugmentedTransaction): Promise<Tr
 
   try {
     const gasLimit = await contract.estimateGas[method](...args);
-    return { transaction: { ...transaction, gasLimit }, succeed: true };
+    return { transaction: { ...transaction, gasLimit }, succeed: true, data };
   } catch (_error) {
     const error = _error as EthersError;
     return { transaction, succeed: false, reason: error.reason };
@@ -217,8 +234,4 @@ export function getTarget(targetAddress: string):
   } catch (error) {
     return { targetAddress };
   }
-}
-
-function scaleByNumber(amount: ethers.BigNumber, scaling: number) {
-  return amount.mul(toBNWei(scaling)).div(fixedPoint);
 }

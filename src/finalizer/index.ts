@@ -1,6 +1,6 @@
 import { utils as sdkUtils } from "@across-protocol/sdk";
 import assert from "assert";
-import { BigNumber, Contract, constants } from "ethers";
+import { Contract } from "ethers";
 import { getAddress } from "ethers/lib/utils";
 import { groupBy, uniq } from "lodash";
 import { AugmentedTransaction, HubPoolClient, MultiCallerClient, TransactionClient } from "../clients";
@@ -8,7 +8,6 @@ import {
   CONTRACT_ADDRESSES,
   Clients,
   FINALIZER_TOKENBRIDGE_LOOKBACK,
-  Multicall2Call,
   ProcessEnv,
   constructClients,
   constructSpokePoolClientsWithLookback,
@@ -17,20 +16,25 @@ import {
 import { DataworkerConfig } from "../dataworker/DataworkerConfig";
 import { SpokePoolClientsByChain } from "../interfaces";
 import {
+  BigNumber,
+  bnZero,
   Signer,
   blockExplorerLink,
   config,
   disconnectRedisClients,
   getMultisender,
   getNetworkName,
+  Multicall2Call,
   processEndPollingLoop,
   startupLogLevel,
   winston,
   CHAIN_IDs,
+  Profiler,
+  stringifyThrownValue,
 } from "../utils";
 import { ChainFinalizer, CrossChainMessage } from "./types";
 import {
-  arbitrumOneFinalizer,
+  arbStackFinalizer,
   cctpL1toL2Finalizer,
   cctpL2toL1Finalizer,
   lineaL1ToL2Finalizer,
@@ -76,8 +80,12 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
+  [CHAIN_IDs.ALEPH_ZERO]: {
+    finalizeOnL1: [arbStackFinalizer],
+    finalizeOnL2: [],
+  },
   [CHAIN_IDs.ARBITRUM]: {
-    finalizeOnL1: [arbitrumOneFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL1: [arbStackFinalizer, cctpL2toL1Finalizer],
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
   [CHAIN_IDs.LINEA]: {
@@ -96,9 +104,49 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL1: [opStackFinalizer],
     finalizeOnL2: [],
   },
+  [CHAIN_IDs.ZORA]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.REDSTONE]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.BLAST]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.SONEIUM]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.WORLD_CHAIN]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.INK]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.UNICHAIN]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
   // Testnets
   [CHAIN_IDs.BASE_SEPOLIA]: {
-    finalizeOnL1: [cctpL2toL1Finalizer],
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.OPTIMISM_SEPOLIA]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.UNICHAIN_SEPOLIA]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.ARBITRUM_SEPOLIA]: {
+    finalizeOnL1: [arbStackFinalizer, cctpL2toL1Finalizer],
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
   [CHAIN_IDs.MODE_SEPOLIA]: {
@@ -110,6 +158,10 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
   [CHAIN_IDs.LISK_SEPOLIA]: {
+    finalizeOnL1: [opStackFinalizer],
+    finalizeOnL2: [],
+  },
+  [CHAIN_IDs.BLAST_SEPOLIA]: {
     finalizeOnL1: [opStackFinalizer],
     finalizeOnL2: [],
   },
@@ -200,21 +252,30 @@ export async function finalize(
     let totalDepositsForChain = 0;
     let totalMiscTxnsForChain = 0;
     await sdkUtils.mapAsync(chainSpecificFinalizers, async (finalizer) => {
-      const { callData, crossChainMessages } = await finalizer(
-        logger,
-        hubSigner,
-        hubPoolClient,
-        client,
-        l1ToL2AddressesToFinalize
-      );
+      try {
+        const { callData, crossChainMessages } = await finalizer(
+          logger,
+          hubSigner,
+          hubPoolClient,
+          client,
+          spokePoolClients[hubChainId],
+          l1ToL2AddressesToFinalize
+        );
 
-      callData.forEach((txn, idx) => {
-        finalizationsToBatch.push({ txn, crossChainMessage: crossChainMessages[idx] });
-      });
+        callData.forEach((txn, idx) => {
+          finalizationsToBatch.push({ txn, crossChainMessage: crossChainMessages[idx] });
+        });
 
-      totalWithdrawalsForChain += crossChainMessages.filter(({ type }) => type === "withdrawal").length;
-      totalDepositsForChain += crossChainMessages.filter(({ type }) => type === "deposit").length;
-      totalMiscTxnsForChain += crossChainMessages.filter(({ type }) => type === "misc").length;
+        totalWithdrawalsForChain += crossChainMessages.filter(({ type }) => type === "withdrawal").length;
+        totalDepositsForChain += crossChainMessages.filter(({ type }) => type === "deposit").length;
+        totalMiscTxnsForChain += crossChainMessages.filter(({ type }) => type === "misc").length;
+      } catch (_e) {
+        logger.error({
+          at: "finalizer",
+          message: `Something errored in a finalizer for chain ${client.chainId}`,
+          errorMsg: stringifyThrownValue(_e),
+        });
+      }
     });
     const totalTransfers = totalWithdrawalsForChain + totalDepositsForChain + totalMiscTxnsForChain;
     logger.debug({
@@ -245,7 +306,7 @@ export async function finalize(
 
   const txnClient = new TransactionClient(logger);
 
-  let gasEstimation = constants.Zero;
+  let gasEstimation = bnZero;
   const batchGasLimit = BigNumber.from(10_000_000);
   // @dev To avoid running into block gas limit in case the # of finalizations gets too high, keep a running
   // counter of the approximate gas estimation and cut off the list of finalizations if it gets too high.
@@ -290,7 +351,9 @@ export async function finalize(
 
   if (finalizations.length > 0) {
     // @dev use multicaller client to execute batched txn to take advantage of its native txn simulation
-    // safety features
+    // safety features. This only works because we assume all finalizer transactions are
+    // unpermissioned (i.e. msg.sender can be anyone). If this is not true for any chain then we'd need to use
+    // the TransactionClient.
     const multicallerClient = new MultiCallerClient(logger);
     let txnHashLookup: Record<number, string[]> = {};
     try {
@@ -385,15 +448,23 @@ export async function constructFinalizerClients(
   const commonClients = await constructClients(_logger, config, baseSigner, hubPoolLookBack);
   await updateFinalizerClients(commonClients);
 
-  // Construct spoke pool clients for all chains that are not *currently* disabled. Caller can override
-  // the disabled chain list by setting the DISABLED_CHAINS_OVERRIDE environment variable.
+  // Make sure we have at least one chain to finalize and that we include the mainnet chain if it's not already
+  // included. Note, we deep copy so that we don't modify config.chainsToFinalize accidentally.
+  const configuredChainIds = [...config.chainsToFinalize];
+  if (configuredChainIds.length === 0) {
+    throw new Error("No chains configured for finalizer");
+  }
+  if (!configuredChainIds.includes(config.hubPoolChainId)) {
+    configuredChainIds.push(config.hubPoolChainId);
+  }
   const spokePoolClients = await constructSpokePoolClientsWithLookback(
     logger,
     commonClients.hubPoolClient,
     commonClients.configStoreClient,
     config,
     baseSigner,
-    config.maxFinalizerLookback
+    config.maxFinalizerLookback,
+    configuredChainIds
   );
 
   return {
@@ -437,17 +508,23 @@ export class FinalizerConfig extends DataworkerConfig {
 
 export async function runFinalizer(_logger: winston.Logger, baseSigner: Signer): Promise<void> {
   logger = _logger;
+
   // Same config as Dataworker for now.
   const config = new FinalizerConfig(process.env);
+  const profiler = new Profiler({
+    logger,
+    at: "Finalizer#index",
+    config,
+  });
 
   logger[startupLogLevel(config)]({ at: "Finalizer#index", message: "Finalizer started 🏋🏿‍♀️", config });
   const { commonClients, spokePoolClients } = await constructFinalizerClients(logger, config, baseSigner);
 
   try {
     for (;;) {
-      const loopStart = performance.now();
+      profiler.mark("loopStart");
       await updateSpokePoolClients(spokePoolClients, ["TokensBridged"]);
-      const loopStartPostSpokePoolUpdates = performance.now();
+      profiler.mark("loopStartPostSpokePoolUpdates");
 
       if (config.finalizerEnabled) {
         const availableChains = commonClients.configStoreClient
@@ -461,19 +538,31 @@ export async function runFinalizer(_logger: winston.Logger, baseSigner: Signer):
           spokePoolClients,
           config.chainsToFinalize.length === 0 ? availableChains : config.chainsToFinalize,
           config.addressesToMonitorForL1L2Finalizer,
-          config.sendingFinalizationsEnabled,
+          config.sendingTransactionsEnabled,
           config.finalizationStrategy
         );
       } else {
         logger[startupLogLevel(config)]({ at: "Dataworker#index", message: "Finalizer disabled" });
       }
-      const loopEndPostFinalizations = performance.now();
 
-      logger.debug({
-        at: "Finalizer#index",
-        message: `Time to loop: ${Math.round((loopEndPostFinalizations - loopStart) / 1000)}s`,
-        timeToUpdateSpokeClients: Math.round((loopStartPostSpokePoolUpdates - loopStart) / 1000),
-        timeToFinalize: Math.round((loopEndPostFinalizations - loopStartPostSpokePoolUpdates) / 1000),
+      profiler.mark("loopEndPostFinalizations");
+
+      profiler.measure("timeToUpdateSpokeClients", {
+        from: "loopStart",
+        to: "loopStartPostSpokePoolUpdates",
+        strategy: config.finalizationStrategy,
+      });
+
+      profiler.measure("timeToFinalize", {
+        from: "loopStartPostSpokePoolUpdates",
+        to: "loopEndPostFinalizations",
+        strategy: config.finalizationStrategy,
+      });
+
+      profiler.measure("loopTime", {
+        message: "Time to loop",
+        from: "loopStart",
+        to: "loopEndPostFinalizations",
         strategy: config.finalizationStrategy,
       });
 

@@ -1,19 +1,25 @@
-import { CHAIN_IDs } from "@across-protocol/constants";
 import { utils } from "@across-protocol/sdk";
-import { spokesThatHoldEthAndWeth, SUPPORTED_TOKENS } from "../../common/Constants";
+import {
+  spokesThatHoldEthAndWeth,
+  SUPPORTED_TOKENS,
+  CUSTOM_BRIDGE,
+  CANONICAL_BRIDGE,
+  DEFAULT_GAS_MULTIPLIER,
+} from "../../common/Constants";
 import { InventoryConfig, OutstandingTransfers } from "../../interfaces";
 import { BigNumber, isDefined, winston, Signer, getL2TokenAddresses, TransactionResponse, assert } from "../../utils";
 import { SpokePoolClient, HubPoolClient } from "../";
-import { ArbitrumAdapter, PolygonAdapter, ZKSyncAdapter, LineaAdapter, OpStackAdapter, BaseAdapter } from "./";
+import { CHAIN_IDs, TOKEN_SYMBOLS_MAP } from "@across-protocol/constants";
+import { BaseChainAdapter } from "../../adapter";
 
 export class AdapterManager {
-  public adapters: { [chainId: number]: BaseAdapter } = {};
+  public adapters: { [chainId: number]: BaseChainAdapter } = {};
 
   // Some L2's canonical bridges send ETH, not WETH, over the canonical bridges, resulting in recipient addresses
   // receiving ETH that needs to be wrapped on the L2. This array contains the chainIds of the chains that this
   // manager will attempt to wrap ETH on into WETH. This list also includes chains like Arbitrum where the relayer is
   // expected to receive ETH as a gas refund from an L1 to L2 deposit that was intended to rebalance inventory.
-  public chainsToWrapEtherOn = [...spokesThatHoldEthAndWeth, CHAIN_IDs.ARBITRUM];
+  private chainsToWrapEtherOn = [...spokesThatHoldEthAndWeth, CHAIN_IDs.ARBITRUM, CHAIN_IDs.MAINNET];
 
   constructor(
     readonly logger: winston.Logger,
@@ -37,56 +43,37 @@ export class AdapterManager {
       );
     };
 
-    const { OPTIMISM, ARBITRUM, POLYGON, ZK_SYNC, BASE, MODE, LINEA, LISK } = CHAIN_IDs;
-    if (this.spokePoolClients[OPTIMISM] !== undefined) {
-      this.adapters[OPTIMISM] = new OpStackAdapter(
-        OPTIMISM,
-        logger,
-        SUPPORTED_TOKENS[OPTIMISM],
-        spokePoolClients,
-        filterMonitoredAddresses(OPTIMISM)
+    const hubChainId = hubPoolClient.chainId;
+    const l1Signer = spokePoolClients[hubChainId].spokePool.signer;
+    const constructBridges = (chainId: number) => {
+      if (chainId === hubChainId) {
+        return {};
+      } // Special case for the EthereumAdapter
+      return Object.fromEntries(
+        SUPPORTED_TOKENS[chainId]?.map((symbol) => {
+          const l2Signer = spokePoolClients[chainId].spokePool.signer;
+          const l1Token = TOKEN_SYMBOLS_MAP[symbol].addresses[hubChainId];
+          const bridgeConstructor = CUSTOM_BRIDGE[chainId]?.[l1Token] ?? CANONICAL_BRIDGE[chainId];
+          const bridge = new bridgeConstructor(chainId, hubChainId, l1Signer, l2Signer, l1Token);
+          return [l1Token, bridge];
+        }) ?? []
       );
-    }
-    if (this.spokePoolClients[POLYGON] !== undefined) {
-      this.adapters[POLYGON] = new PolygonAdapter(logger, spokePoolClients, filterMonitoredAddresses(POLYGON));
-    }
-    if (this.spokePoolClients[ARBITRUM] !== undefined) {
-      this.adapters[ARBITRUM] = new ArbitrumAdapter(logger, spokePoolClients, filterMonitoredAddresses(ARBITRUM));
-    }
-    if (this.spokePoolClients[ZK_SYNC] !== undefined) {
-      this.adapters[ZK_SYNC] = new ZKSyncAdapter(logger, spokePoolClients, filterMonitoredAddresses(ZK_SYNC));
-    }
-    if (this.spokePoolClients[BASE] !== undefined) {
-      this.adapters[BASE] = new OpStackAdapter(
-        BASE,
-        logger,
-        SUPPORTED_TOKENS[BASE],
+    };
+    Object.keys(this.spokePoolClients).map((_chainId) => {
+      const chainId = Number(_chainId);
+      assert(chainId.toString() === _chainId);
+      // Instantiate a generic adapter and supply all network-specific configurations.
+      this.adapters[chainId] = new BaseChainAdapter(
         spokePoolClients,
-        filterMonitoredAddresses(BASE)
-      );
-    }
-    if (this.spokePoolClients[LINEA] !== undefined) {
-      this.adapters[LINEA] = new LineaAdapter(logger, spokePoolClients, filterMonitoredAddresses(LINEA));
-    }
-    if (this.spokePoolClients[MODE] !== undefined) {
-      this.adapters[MODE] = new OpStackAdapter(
-        MODE,
+        chainId,
+        hubChainId,
+        filterMonitoredAddresses(chainId),
         logger,
-        SUPPORTED_TOKENS[MODE],
-        spokePoolClients,
-        filterMonitoredAddresses(MODE)
+        SUPPORTED_TOKENS[chainId] ?? [],
+        constructBridges(chainId),
+        DEFAULT_GAS_MULTIPLIER[chainId] ?? 1
       );
-    }
-    if (this.spokePoolClients[LISK] !== undefined) {
-      this.adapters[LISK] = new OpStackAdapter(
-        LISK,
-        logger,
-        SUPPORTED_TOKENS[LISK],
-        spokePoolClients,
-        filterMonitoredAddresses(LISK)
-      );
-    }
-
+    });
     logger.debug({
       at: "AdapterManager#constructor",
       message: "Initialized AdapterManager",
@@ -106,7 +93,7 @@ export class AdapterManager {
     const adapter = this.adapters[chainId];
     // @dev The adapter should filter out tokens that are not supported by the adapter, but we do it here as well.
     const adapterSupportedL1Tokens = l1Tokens.filter((token) =>
-      adapter.supportedTokens.includes(this.hubPoolClient.getTokenInfo(CHAIN_IDs.MAINNET, token).symbol)
+      adapter.supportedTokens.includes(this.hubPoolClient.getTokenInfo(this.hubPoolClient.chainId, token).symbol)
     );
     this.logger.debug({
       at: "AdapterManager",
@@ -183,14 +170,14 @@ export class AdapterManager {
     }
   }
 
-  async setL1TokenApprovals(address: string, l1Tokens: string[]): Promise<void> {
+  async setL1TokenApprovals(l1Tokens: string[]): Promise<void> {
     // Each of these calls must happen sequentially or we'll have collisions within the TransactionUtil. This should
     // be refactored in a follow on PR to separate out by nonce increment by making the transaction util stateful.
     for (const chainId of this.supportedChains()) {
       const adapter = this.adapters[chainId];
       if (isDefined(adapter)) {
         const hubTokens = l1Tokens.filter((token) => this.l2TokenExistForL1Token(token, chainId));
-        await adapter.checkTokenApprovals(address, hubTokens);
+        await adapter.checkTokenApprovals(hubTokens);
       }
     }
   }

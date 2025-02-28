@@ -15,6 +15,10 @@ import {
   ZERO_ADDRESS,
   chainIsMatic,
   CHAIN_IDs,
+  getWidestPossibleExpectedBlockRange,
+  getEndBlockBuffers,
+  _buildPoolRebalanceRoot,
+  ERC20,
 } from "../utils";
 import {
   ProposedRootBundle,
@@ -24,34 +28,34 @@ import {
   RunningBalances,
   PoolRebalanceLeaf,
   RelayerRefundLeaf,
-  V3SlowFillLeaf,
+  SlowFillLeaf,
   FillStatus,
 } from "../interfaces";
+import { DataworkerConfig } from "./DataworkerConfig";
 import { DataworkerClients } from "./DataworkerClientHelper";
-import { SpokePoolClient, BalanceAllocator } from "../clients";
+import { SpokePoolClient, BalanceAllocator, BundleDataClient } from "../clients";
 import * as PoolRebalanceUtils from "./PoolRebalanceUtils";
 import {
   blockRangesAreInvalidForSpokeClients,
   getBlockRangeForChain,
   getImpliedBundleBlockRanges,
+  InvalidBlockRange,
   l2TokensToCountTowardsSpokePoolLeafExecutionCapital,
+  persistDataToArweave,
 } from "../dataworker/DataworkerUtils";
-import {
-  getEndBlockBuffers,
-  _buildPoolRebalanceRoot,
-  _buildRelayerRefundRoot,
-  _buildSlowRelayRoot,
-} from "./DataworkerUtils";
+import { _buildRelayerRefundRoot, _buildSlowRelayRoot } from "./DataworkerUtils";
 import _ from "lodash";
-import { CONTRACT_ADDRESSES, spokePoolClientsToProviders } from "../common";
+import { ARBITRUM_ORBIT_L1L2_MESSAGE_FEE_DATA, CONTRACT_ADDRESSES, spokePoolClientsToProviders } from "../common";
 import * as sdk from "@across-protocol/sdk";
 import {
+  BundleData,
   BundleDepositsV3,
   BundleExcessSlowFills,
   BundleFillsV3,
   BundleSlowFills,
   ExpiredDepositsToRefundV3,
 } from "../interfaces/BundleData";
+import { convertRelayDataParamsToBytes32 } from "../utils/DepositUtils";
 
 // Internal error reasons for labeling a pending root bundle as "invalid" that we don't want to submit a dispute
 // for. These errors are due to issues with the dataworker configuration, instead of with the pending root
@@ -60,19 +64,13 @@ import {
 const IGNORE_DISPUTE_REASONS = new Set(["bundle-end-block-buffer"]);
 const ERROR_DISPUTE_REASONS = new Set(["insufficient-dataworker-lookback", "out-of-date-config-store-version"]);
 
+const { getMessageHash, getRelayEventKey } = sdkUtils;
+const { getAddress } = ethersUtils;
+
 // Create a type for storing a collection of roots
 type SlowRootBundle = {
-  leaves: V3SlowFillLeaf[];
-  tree: MerkleTree<V3SlowFillLeaf>;
-};
-
-export type BundleDataToPersistToDALayerType = {
-  bundleBlockRanges: number[][];
-  bundleDepositsV3: BundleDepositsV3;
-  expiredDepositsToRefundV3: ExpiredDepositsToRefundV3;
-  bundleFillsV3: BundleFillsV3;
-  unexecutableSlowFills: BundleExcessSlowFills;
-  bundleSlowFillsV3: BundleSlowFills;
+  leaves: SlowFillLeaf[];
+  tree: MerkleTree<SlowFillLeaf>;
 };
 
 type ProposeRootBundleReturnType = {
@@ -80,9 +78,9 @@ type ProposeRootBundleReturnType = {
   poolRebalanceTree: MerkleTree<PoolRebalanceLeaf>;
   relayerRefundLeaves: RelayerRefundLeaf[];
   relayerRefundTree: MerkleTree<RelayerRefundLeaf>;
-  slowFillLeaves: V3SlowFillLeaf[];
-  slowFillTree: MerkleTree<V3SlowFillLeaf>;
-  dataToPersistToDALayer: BundleDataToPersistToDALayerType;
+  slowFillLeaves: SlowFillLeaf[];
+  slowFillTree: MerkleTree<SlowFillLeaf>;
+  bundleData: BundleData;
 };
 
 export type PoolRebalanceRoot = {
@@ -92,7 +90,7 @@ export type PoolRebalanceRoot = {
   tree: MerkleTree<PoolRebalanceLeaf>;
 };
 
-type PoolRebalanceRootCache = Record<string, Promise<PoolRebalanceRoot>>;
+type PoolRebalanceRootCache = Record<string, PoolRebalanceRoot>;
 
 // @notice Constructs roots to submit to HubPool on L1. Fetches all data synchronously from SpokePool/HubPool clients
 // so this class assumes that those upstream clients are already updated and have fetched on-chain data from RPC's.
@@ -102,6 +100,7 @@ export class Dataworker {
   // eslint-disable-next-line no-useless-constructor
   constructor(
     readonly logger: winston.Logger,
+    readonly config: DataworkerConfig,
     readonly clients: DataworkerClients,
     readonly chainIdListForBundleEvaluationBlockNumbers: number[],
     readonly maxRefundCountOverride: number | undefined,
@@ -196,7 +195,7 @@ export class Dataworker {
       this.chainIdListForBundleEvaluationBlockNumbers
     )[1];
 
-    return await this._getPoolRebalanceRoot(
+    return this._getPoolRebalanceRoot(
       blockRangesForChains,
       latestMainnetBlock ?? mainnetBundleEndBlock,
       mainnetBundleEndBlock,
@@ -318,24 +317,19 @@ export class Dataworker {
 
     // Exit early if spoke pool clients don't have early enough event data to satisfy block ranges for the
     // potential proposal
-    if (
-      Object.keys(earliestBlocksInSpokePoolClients).length > 0 &&
-      (await blockRangesAreInvalidForSpokeClients(
-        spokePoolClients,
-        blockRangesForProposal,
-        chainIds,
-        earliestBlocksInSpokePoolClients,
-        this.isV3(mainnetBlockRange[0])
-      ))
-    ) {
+    const invalidBlockRanges = await this._validateBlockRanges(
+      spokePoolClients,
+      blockRangesForProposal,
+      chainIds,
+      earliestBlocksInSpokePoolClients,
+      this.isV3(mainnetBlockRange[0])
+    );
+    if (invalidBlockRanges.length > 0) {
       this.logger.warn({
         at: "Dataworke#propose",
         message: "Cannot propose bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
-        rootBundleRanges: blockRangesForProposal,
-        earliestBlocksInSpokePoolClients,
-        spokeClientsEventSearchConfigs: Object.fromEntries(
-          Object.entries(spokePoolClients).map(([chainId, client]) => [chainId, client.eventSearchConfig])
-        ),
+        invalidBlockRanges,
+        bundleBlockRanges: this._prettifyBundleBlockRanges(chainIds, blockRangesForProposal),
       });
       return;
     }
@@ -352,12 +346,15 @@ export class Dataworker {
     );
   }
 
+  /**
+   * @returns bundle data if new proposal transaction is enqueued, else undefined
+   */
   async proposeRootBundle(
     spokePoolClients: { [chainId: number]: SpokePoolClient },
     usdThresholdToSubmitNewBundle?: BigNumber,
     submitProposals = true,
     earliestBlocksInSpokePoolClients: { [chainId: number]: number } = {}
-  ): Promise<BundleDataToPersistToDALayerType> {
+  ): Promise<BundleData> {
     // TODO: Handle the case where we can't get event data or even blockchain data from any chain. This will require
     // some changes to override the bundle block range here, and loadData to skip chains with zero block ranges.
     // For now, we assume that if one blockchain fails to return data, then this entire function will fail. This is a
@@ -466,7 +463,7 @@ export class Dataworker {
         rootBundleData.slowFillTree.getHexRoot()
       );
     }
-    return rootBundleData.dataToPersistToDALayer;
+    return rootBundleData.bundleData;
   }
 
   async _proposeRootBundle(
@@ -479,11 +476,7 @@ export class Dataworker {
     const timerStart = Date.now();
     const { bundleDepositsV3, bundleFillsV3, bundleSlowFillsV3, unexecutableSlowFills, expiredDepositsToRefundV3 } =
       await this.clients.bundleDataClient.loadData(blockRangesForProposal, spokePoolClients, loadDataFromArweave);
-    // Prepare information about what we need to store to
-    // Arweave for the bundle. We will be doing this at a
-    // later point so that we can confirm that this data is
-    // worth storing.
-    const dataToPersistToDALayer = {
+    const bundleData = {
       bundleBlockRanges: blockRangesForProposal,
       bundleDepositsV3,
       expiredDepositsToRefundV3,
@@ -493,7 +486,7 @@ export class Dataworker {
     };
     const [, mainnetBundleEndBlock] = blockRangesForProposal[0];
 
-    const poolRebalanceRoot = await this._getPoolRebalanceRoot(
+    const poolRebalanceRoot = this._getPoolRebalanceRoot(
       blockRangesForProposal,
       latestMainnetBundleEndBlock,
       mainnetBundleEndBlock,
@@ -545,14 +538,15 @@ export class Dataworker {
       relayerRefundTree: relayerRefundRoot.tree,
       slowFillLeaves: slowRelayRoot.leaves,
       slowFillTree: slowRelayRoot.tree,
-      dataToPersistToDALayer,
+      bundleData,
     };
   }
 
   async validatePendingRootBundle(
     spokePoolClients: { [chainId: number]: SpokePoolClient },
     submitDisputes = true,
-    earliestBlocksInSpokePoolClients: { [chainId: number]: number } = {}
+    earliestBlocksInSpokePoolClients: { [chainId: number]: number } = {},
+    persistBundleData = false
   ): Promise<void> {
     if (!this.clients.hubPoolClient.isUpdated || this.clients.hubPoolClient.currentTime === undefined) {
       throw new Error("HubPoolClient not updated");
@@ -591,7 +585,7 @@ export class Dataworker {
       // Mainnet bundle start block for pending bundle is the first entry in the first entry.
       nextBundleMainnetStartBlock
     );
-    const { valid, reason } = await this.validateRootBundle(
+    const { valid, reason, bundleData, expectedTrees } = await this.validateRootBundle(
       hubPoolChainId,
       widestPossibleExpectedBlockRange,
       pendingRootBundle,
@@ -624,6 +618,64 @@ export class Dataworker {
         }
       }
     }
+
+    // Root bundle is valid, attempt to persist the raw bundle data and the merkle leaf data to DA layer
+    // if not already there.
+    if (persistBundleData && isDefined(bundleData)) {
+      const chainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(nextBundleMainnetStartBlock);
+      // Store the bundle block ranges on Arweave as a map of chainId to block range to aid users in querying.
+      const bundleBlockRangeMap = Object.fromEntries(
+        bundleData.bundleBlockRanges.map((range, i) => {
+          const chainIdForRange = chainIds[i];
+          return [chainIdForRange, range];
+        })
+      );
+      // As a unique key for this bundle, use the next bundle mainnet start block, which should
+      // never be duplicated between bundles as long as the mainnet end block in the bundle block range
+      // always progresses forwards, which I think is a safe assumption. Other chains might pause
+      // but mainnet should never pause.
+      const partialArweaveDataKey = BundleDataClient.getArweaveClientKey(bundleData.bundleBlockRanges);
+      await Promise.all([
+        persistDataToArweave(
+          this.clients.arweaveClient,
+          {
+            ...bundleData,
+            bundleBlockRanges: bundleBlockRangeMap,
+          },
+          this.logger,
+          `bundles-${partialArweaveDataKey}`
+        ),
+        persistDataToArweave(
+          this.clients.arweaveClient,
+          {
+            bundleBlockRanges: bundleBlockRangeMap,
+            poolRebalanceLeaves: expectedTrees.poolRebalanceTree.leaves.map((leaf) => {
+              return {
+                ...leaf,
+                proof: expectedTrees.poolRebalanceTree.tree.getHexProof(leaf),
+              };
+            }),
+            poolRebalanceRoot: expectedTrees.poolRebalanceTree.tree.getHexRoot(),
+            relayerRefundLeaves: expectedTrees.relayerRefundTree.leaves.map((leaf) => {
+              return {
+                ...leaf,
+                proof: expectedTrees.relayerRefundTree.tree.getHexProof(leaf),
+              };
+            }),
+            relayerRefundRoot: expectedTrees.relayerRefundTree.tree.getHexRoot(),
+            slowRelayLeaves: expectedTrees.slowRelayTree.leaves.map((leaf) => {
+              return {
+                ...leaf,
+                proof: expectedTrees.slowRelayTree.tree.getHexProof(leaf),
+              };
+            }),
+            slowRelayRoot: expectedTrees.slowRelayTree.tree.getHexRoot(),
+          },
+          this.logger,
+          `merkletree-${partialArweaveDataKey}`
+        ),
+      ]);
+    }
   }
 
   async validateRootBundle(
@@ -648,10 +700,11 @@ export class Dataworker {
             leaves: RelayerRefundLeaf[];
           };
           slowRelayTree: {
-            tree: MerkleTree<V3SlowFillLeaf>;
-            leaves: V3SlowFillLeaf[];
+            tree: MerkleTree<SlowFillLeaf>;
+            leaves: SlowFillLeaf[];
           };
         };
+        bundleData?: BundleData;
       }
     // If valid is true, we don't get a reason, and we always get expected trees.
     | {
@@ -667,10 +720,11 @@ export class Dataworker {
             leaves: RelayerRefundLeaf[];
           };
           slowRelayTree: {
-            tree: MerkleTree<V3SlowFillLeaf>;
-            leaves: V3SlowFillLeaf[];
+            tree: MerkleTree<SlowFillLeaf>;
+            leaves: SlowFillLeaf[];
           };
         };
+        bundleData: BundleData;
       }
   > {
     // If pool rebalance root is empty, always dispute. There should never be a bundle with an empty rebalance root.
@@ -700,10 +754,12 @@ export class Dataworker {
       };
     }
 
-    const blockRangesImpliedByBundleEndBlocks = widestPossibleExpectedBlockRange.map((blockRange, index) => [
-      blockRange[0],
-      rootBundle.bundleEvaluationBlockNumbers[index],
-    ]);
+    const blockRangesImpliedByBundleEndBlocks = widestPossibleExpectedBlockRange.map((blockRange, index) => {
+      // Block ranges must be coherent; otherwise the chain is soft-paused.
+      const [startBlock, endBlock] = [blockRange[0], rootBundle.bundleEvaluationBlockNumbers[index]];
+      return endBlock > startBlock ? [startBlock, endBlock] : [endBlock, endBlock];
+    });
+
     const mainnetBlockRange = blockRangesImpliedByBundleEndBlocks[0];
     const mainnetBundleStartBlock = mainnetBlockRange[0];
     const chainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(mainnetBundleStartBlock);
@@ -783,25 +839,19 @@ export class Dataworker {
 
     // Exit early if spoke pool clients don't have early enough event data to satisfy block ranges for the
     // pending proposal. Log an error loudly so that user knows that disputer needs to increase its lookback.
-    if (
-      Object.keys(earliestBlocksInSpokePoolClients).length > 0 &&
-      (await blockRangesAreInvalidForSpokeClients(
-        spokePoolClients,
-        blockRangesImpliedByBundleEndBlocks,
-        chainIds,
-        earliestBlocksInSpokePoolClients,
-        this.isV3(mainnetBlockRange[0])
-      ))
-    ) {
-      this.logger.debug({
+    const invalidBlockRanges = await this._validateBlockRanges(
+      spokePoolClients,
+      blockRangesImpliedByBundleEndBlocks,
+      chainIds,
+      earliestBlocksInSpokePoolClients,
+      this.isV3(mainnetBlockRange[0])
+    );
+    if (invalidBlockRanges.length > 0) {
+      this.logger.warn({
         at: "Dataworke#validate",
         message: "Cannot validate bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
-        rootBundleRanges: blockRangesImpliedByBundleEndBlocks,
-        availableSpokePoolClients: Object.keys(spokePoolClients),
-        earliestBlocksInSpokePoolClients,
-        spokeClientsEventSearchConfigs: Object.fromEntries(
-          Object.entries(spokePoolClients).map(([chainId, client]) => [chainId, client.eventSearchConfig])
-        ),
+        invalidBlockRanges,
+        bundleBlockRanges: this._prettifyBundleBlockRanges(chainIds, blockRangesImpliedByBundleEndBlocks),
       });
       return {
         valid: false,
@@ -919,6 +969,7 @@ export class Dataworker {
         valid: true,
         expectedTrees,
         reason: undefined,
+        bundleData: rootBundleData.bundleData,
       };
     }
 
@@ -1020,27 +1071,20 @@ export class Dataworker {
           );
           const mainnetBlockRange = blockNumberRanges[0];
           const chainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(mainnetBlockRange[0]);
-          if (
-            Object.keys(earliestBlocksInSpokePoolClients).length > 0 &&
-            (await blockRangesAreInvalidForSpokeClients(
-              spokePoolClients,
-              blockNumberRanges,
-              chainIds,
-              earliestBlocksInSpokePoolClients,
-              this.isV3(mainnetBlockRange[0])
-            ))
-          ) {
+          const invalidBlockRanges = await this._validateBlockRanges(
+            spokePoolClients,
+            blockNumberRanges,
+            chainIds,
+            earliestBlocksInSpokePoolClients,
+            this.isV3(mainnetBlockRange[0])
+          );
+          if (invalidBlockRanges.length > 0) {
             this.logger.warn({
               at: "Dataworke#executeSlowRelayLeaves",
               message:
                 "Cannot validate bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
-              chainId,
-              rootBundleRanges: blockNumberRanges,
-              availableSpokePoolClients: Object.keys(spokePoolClients),
-              earliestBlocksInSpokePoolClients,
-              spokeClientsEventSearchConfigs: Object.fromEntries(
-                Object.entries(spokePoolClients).map(([chainId, client]) => [chainId, client.eventSearchConfig])
-              ),
+              invalidBlockRanges,
+              bundleTxn: matchingRootBundle.transactionHash,
             });
             continue;
           }
@@ -1075,7 +1119,7 @@ export class Dataworker {
           const unexecutedLeaves = leavesForChain.filter((leaf) => {
             const executedLeaf = slowFillsForChain.find(
               (event) =>
-                event.originChainId === leaf.relayData.originChainId && event.depositId === leaf.relayData.depositId
+                event.originChainId === leaf.relayData.originChainId && event.depositId.eq(leaf.relayData.depositId)
             );
 
             // Only return true if no leaf was found in the list of executed leaves.
@@ -1099,10 +1143,10 @@ export class Dataworker {
   }
 
   async _executeSlowFillLeaf(
-    _leaves: V3SlowFillLeaf[],
+    _leaves: SlowFillLeaf[],
     balanceAllocator: BalanceAllocator,
     client: SpokePoolClient,
-    slowRelayTree: MerkleTree<V3SlowFillLeaf>,
+    slowRelayTree: MerkleTree<SlowFillLeaf>,
     submitExecution: boolean,
     rootBundleId?: number
   ): Promise<void> {
@@ -1115,7 +1159,7 @@ export class Dataworker {
 
       // If there is a message, we ignore the leaf and log an error.
       if (!sdk.utils.isMessageEmpty(message)) {
-        const { method, args } = this.encodeV3SlowFillLeaf(slowRelayTree, rootBundleId, leaf);
+        const { method, args } = this.encodeSlowFillLeaf(slowRelayTree, rootBundleId, leaf);
 
         this.logger.warn({
           at: "Dataworker#_executeSlowFillLeaf",
@@ -1126,13 +1170,8 @@ export class Dataworker {
         return false;
       }
 
-      const ignoredAddresses = JSON.parse(process.env.IGNORED_ADDRESSES ?? "[]").map((address) =>
-        ethersUtils.getAddress(address)
-      );
-      if (
-        ignoredAddresses?.includes(ethersUtils.getAddress(depositor)) ||
-        ignoredAddresses?.includes(ethersUtils.getAddress(recipient))
-      ) {
+      const { ignoredAddresses } = this.config;
+      if (ignoredAddresses?.has(getAddress(depositor)) || ignoredAddresses?.has(getAddress(recipient))) {
         this.logger.warn({
           at: "Dataworker#_executeSlowFillLeaf",
           message: "Ignoring slow fill.",
@@ -1152,21 +1191,17 @@ export class Dataworker {
 
     const sortedFills = client.getFills();
     const latestFills = leaves.map((slowFill) => {
-      const { relayData, chainId: slowFillChainId } = slowFill;
+      const { relayData, chainId: destinationChainId } = slowFill;
+      const messageHash = getMessageHash(relayData.message);
 
       // Start with the most recent fills and search backwards.
-      const fill = _.findLast(sortedFills, (fill) => {
-        if (
-          !(
-            fill.depositId === relayData.depositId &&
-            fill.originChainId === relayData.originChainId &&
-            sdkUtils.getRelayDataHash(fill, chainId) === sdkUtils.getRelayDataHash(relayData, slowFillChainId)
-          )
-        ) {
-          return false;
-        }
-        return true;
-      });
+      const fill = _.findLast(
+        sortedFills,
+        (fill) =>
+          fill.depositId.eq(relayData.depositId) &&
+          fill.originChainId === relayData.originChainId &&
+          getRelayEventKey(fill) === getRelayEventKey({ ...relayData, messageHash, destinationChainId })
+      );
 
       return fill;
     });
@@ -1225,6 +1260,12 @@ export class Dataworker {
               chainId: destinationChainId,
               token: outputToken,
               amount: outputAmount,
+              spokeBalance: await this._getSpokeBalanceForL2Tokens(
+                balanceAllocator,
+                destinationChainId,
+                outputToken,
+                client.spokePool.address
+              ),
             });
           }
 
@@ -1246,11 +1287,11 @@ export class Dataworker {
         `slowRelayRoot: ${slowRelayTree.getHexRoot()}\n` +
         `Origin chain: ${relayData.originChainId}\n` +
         `Destination chain:${chainId}\n` +
-        `Deposit Id: ${relayData.depositId}\n` +
+        `Deposit Id: ${relayData.depositId.toString()}\n` +
         `amount: ${outputAmount.toString()}`;
 
       if (submitExecution) {
-        const { method, args } = this.encodeV3SlowFillLeaf(slowRelayTree, rootBundleId, leaf);
+        const { method, args } = this.encodeSlowFillLeaf(slowRelayTree, rootBundleId, leaf);
 
         this.clients.multiCallerClient.enqueueTransaction({
           contract: client.spokePool,
@@ -1275,16 +1316,22 @@ export class Dataworker {
     });
   }
 
-  encodeV3SlowFillLeaf(
-    slowRelayTree: MerkleTree<V3SlowFillLeaf>,
+  encodeSlowFillLeaf(
+    slowRelayTree: MerkleTree<SlowFillLeaf>,
     rootBundleId: number,
-    leaf: V3SlowFillLeaf
-  ): { method: string; args: (number | string[] | V3SlowFillLeaf)[] } {
-    const { relayData, chainId, updatedOutputAmount } = leaf;
-
-    const method = "executeV3SlowRelayLeaf";
-    const proof = slowRelayTree.getHexProof({ relayData, chainId, updatedOutputAmount });
-    const args = [leaf, rootBundleId, proof];
+    leaf: SlowFillLeaf
+  ): { method: string; args: (number | string[] | SlowFillLeaf)[] } {
+    const method = "executeSlowRelayLeaf";
+    const proof = slowRelayTree.getHexProof(leaf);
+    const relayDataWithBytes32Params = convertRelayDataParamsToBytes32(leaf.relayData);
+    const args = [
+      {
+        ...leaf,
+        relayData: relayDataWithBytes32Params,
+      },
+      rootBundleId,
+      proof,
+    ];
 
     return { method, args };
   }
@@ -1304,7 +1351,7 @@ export class Dataworker {
     submitExecution = true,
     earliestBlocksInSpokePoolClients: { [chainId: number]: number } = {}
   ): Promise<number> {
-    let leafCount = 0;
+    const leafCount = 0;
     this.logger.debug({
       at: "Dataworker#executePoolRebalanceLeaves",
       message: "Executing pool rebalance leaves",
@@ -1411,6 +1458,32 @@ export class Dataworker {
       return leafCount;
     }
 
+    return this._executePoolLeavesAndSyncL1Tokens(
+      spokePoolClients,
+      balanceAllocator,
+      unexecutedLeaves,
+      expectedTrees.poolRebalanceTree.tree,
+      expectedTrees.relayerRefundTree.leaves,
+      expectedTrees.relayerRefundTree.tree,
+      expectedTrees.slowRelayTree.leaves,
+      expectedTrees.slowRelayTree.tree,
+      submitExecution
+    );
+  }
+
+  async _executePoolLeavesAndSyncL1Tokens(
+    spokePoolClients: { [chainId: number]: SpokePoolClient },
+    balanceAllocator: BalanceAllocator,
+    poolLeaves: PoolRebalanceLeaf[],
+    poolRebalanceTree: MerkleTree<PoolRebalanceLeaf>,
+    relayerRefundLeaves: RelayerRefundLeaf[],
+    relayerRefundTree: MerkleTree<RelayerRefundLeaf>,
+    slowFillLeaves: SlowFillLeaf[],
+    slowFillTree: MerkleTree<SlowFillLeaf>,
+    submitExecution: boolean
+  ): Promise<number> {
+    const hubPoolChainId = this.clients.hubPoolClient.chainId;
+
     // There are three times that we should look to update the HubPool's liquid reserves:
     // 1. First, before we attempt to execute the HubChain PoolRebalance leaves and RelayerRefund leaves.
     //    We should see if there are new liquid reserves we need to account for before sending out these
@@ -1421,15 +1494,21 @@ export class Dataworker {
     //    back from the Ethereum RelayerRefundLeaves.
     // 3. Third, we haven't updated the exchange rate for an L1 token on a PoolRebalanceLeaf in a while that
     //    we're going to execute, so we should batch in an update.
-    let updatedLiquidReserves: Record<string, BigNumber> = {};
+
+    // Keep track of the HubPool.pooledTokens.liquidReserves state value before entering into any possible
+    // LP token update. This way we can efficiently update LP liquid reserves values if and only if we need to do so
+    // to execute a pool leaf.
+    let latestLiquidReserves: Record<string, BigNumber> = {};
+    let leafCount = 0;
 
     // First, execute mainnet pool rebalance leaves. Then try to execute any relayer refund and slow leaves for the
     // expected relayed root hash, then proceed with remaining pool rebalance leaves. This is an optimization that
     // takes advantage of the fact that mainnet transfers between HubPool and SpokePool are atomic.
-    const mainnetLeaves = unexecutedLeaves.filter((leaf) => leaf.chainId === hubPoolChainId);
+    const mainnetLeaves = poolLeaves.filter((leaf) => leaf.chainId === hubPoolChainId);
     if (mainnetLeaves.length > 0) {
-      assert(mainnetLeaves.length === 1);
-      updatedLiquidReserves = await this._updateExchangeRatesBeforeExecutingHubChainLeaves(
+      assert(mainnetLeaves.length === 1, "There should only be one Ethereum PoolRebalanceLeaf");
+      latestLiquidReserves = await this._updateExchangeRatesBeforeExecutingHubChainLeaves(
+        balanceAllocator,
         mainnetLeaves[0],
         submitExecution
       );
@@ -1437,7 +1516,7 @@ export class Dataworker {
         spokePoolClients,
         mainnetLeaves,
         balanceAllocator,
-        expectedTrees.poolRebalanceTree.tree,
+        poolRebalanceTree,
         submitExecution
       );
 
@@ -1445,21 +1524,21 @@ export class Dataworker {
       // will be relayed after executing the above pool rebalance root.
       const nextRootBundleIdForMainnet = spokePoolClients[hubPoolChainId].getLatestRootBundleId();
 
-      // Now, execute refund and slow fill leaves for Mainnet using new funds. These methods will return early if there
+      // Now, execute refund and slow fill leaves for Mainnet using any new funds. These methods will return early if there
       // are no relevant leaves to execute.
       await this._executeSlowFillLeaf(
-        expectedTrees.slowRelayTree.leaves.filter((leaf) => leaf.chainId === hubPoolChainId),
+        slowFillLeaves.filter((leaf) => leaf.chainId === hubPoolChainId),
         balanceAllocator,
         spokePoolClients[hubPoolChainId],
-        expectedTrees.slowRelayTree.tree,
+        slowFillTree,
         submitExecution,
         nextRootBundleIdForMainnet
       );
       await this._executeRelayerRefundLeaves(
-        expectedTrees.relayerRefundTree.leaves.filter((leaf) => leaf.chainId === hubPoolChainId),
+        relayerRefundLeaves.filter((leaf) => leaf.chainId === hubPoolChainId),
         balanceAllocator,
         spokePoolClients[hubPoolChainId],
-        expectedTrees.relayerRefundTree.tree,
+        relayerRefundTree,
         submitExecution,
         nextRootBundleIdForMainnet
       );
@@ -1467,30 +1546,29 @@ export class Dataworker {
 
     // Before executing the other pool rebalance leaves, see if we should update any exchange rates to account for
     // any tokens returned to the hub pool via the EthereumSpokePool that we'll need to use to execute
-    // any of the remaining pool rebalance leaves. This might include tokens we've already enqueued to update
-    // in the previous step, but this captures any tokens that are sent back from the Ethereum_SpokePool to the
-    // HubPool that we want to capture an increased liquidReserves for.
-    const nonHubChainPoolRebalanceLeaves = unexecutedLeaves.filter((leaf) => leaf.chainId !== hubPoolChainId);
+    // any of the remaining pool rebalance leaves. This is also important if we failed to execute
+    // the mainnet leaf and haven't enqueued a sync call that could be used to execute some of the other leaves.
+    const nonHubChainPoolRebalanceLeaves = poolLeaves.filter((leaf) => leaf.chainId !== hubPoolChainId);
     if (nonHubChainPoolRebalanceLeaves.length === 0) {
       return leafCount;
     }
-    const updatedL1Tokens = await this._updateExchangeRatesBeforeExecutingNonHubChainLeaves(
-      updatedLiquidReserves,
+    const syncedL1Tokens = await this._updateExchangeRatesBeforeExecutingNonHubChainLeaves(
+      latestLiquidReserves,
       balanceAllocator,
       nonHubChainPoolRebalanceLeaves,
       submitExecution
     );
-    Object.keys(updatedLiquidReserves).forEach((token) => {
-      if (!updatedL1Tokens.has(token)) {
-        updatedL1Tokens.add(token);
+    Object.keys(latestLiquidReserves).forEach((token) => {
+      if (!syncedL1Tokens.has(token)) {
+        syncedL1Tokens.add(token);
       }
     });
 
     // Save all L1 tokens that we haven't updated exchange rates for in a different step.
-    const l1TokensWithPotentiallyOlderUpdate = expectedTrees.poolRebalanceTree.leaves.reduce((l1TokenSet, leaf) => {
+    const l1TokensWithPotentiallyOlderUpdate = poolLeaves.reduce((l1TokenSet, leaf) => {
       const currLeafL1Tokens = leaf.l1Tokens;
-      currLeafL1Tokens.forEach((l1Token) => {
-        if (!l1TokenSet.includes(l1Token) && !updatedL1Tokens.has(l1Token)) {
+      currLeafL1Tokens.forEach((l1Token, i) => {
+        if (leaf.netSendAmounts[i].gt(0) && !l1TokenSet.includes(l1Token) && !syncedL1Tokens.has(l1Token)) {
           l1TokenSet.push(l1Token);
         }
       });
@@ -1498,112 +1576,171 @@ export class Dataworker {
     }, []);
     await this._updateOldExchangeRates(l1TokensWithPotentiallyOlderUpdate, submitExecution);
 
-    // Perform similar funding checks for remaining non-mainnet pool rebalance leaves.
+    // Figure out which non-mainnet pool rebalance leaves we can execute and execute them:
     leafCount += await this._executePoolRebalanceLeaves(
       spokePoolClients,
       nonHubChainPoolRebalanceLeaves,
       balanceAllocator,
-      expectedTrees.poolRebalanceTree.tree,
+      poolRebalanceTree,
       submitExecution
     );
     return leafCount;
+  }
+
+  async _getExecutablePoolRebalanceLeaves(
+    poolLeaves: PoolRebalanceLeaf[],
+    balanceAllocator: BalanceAllocator
+  ): Promise<PoolRebalanceLeaf[]> {
+    // We evaluate these leaves iteratively rather than in parallel so we can keep track
+    // of the used balances after "executing" each leaf.
+    const executableLeaves: PoolRebalanceLeaf[] = [];
+    for (const leaf of poolLeaves) {
+      // We can evaluate the l1 tokens within the leaf in parallel because we can assume
+      // that there are not duplicate L1 tokens within the leaf.
+      const isExecutable = await sdkUtils.everyAsync(leaf.l1Tokens, async (l1Token, i) => {
+        const netSendAmountForLeaf = leaf.netSendAmounts[i];
+        if (netSendAmountForLeaf.lte(0)) {
+          return true;
+        }
+        const hubChainId = this.clients.hubPoolClient.chainId;
+        const hubPoolAddress = this.clients.hubPoolClient.hubPool.address;
+        const success = await balanceAllocator.requestBalanceAllocation(
+          hubChainId,
+          [l1Token],
+          hubPoolAddress,
+          netSendAmountForLeaf
+        );
+        return success;
+      });
+      if (isExecutable) {
+        executableLeaves.push(leaf);
+      } else {
+        this.logger.error({
+          at: "Dataworker#_getExecutablePoolRebalanceLeaves",
+          message: `Not enough funds to execute pool rebalance leaf for chain ${leaf.chainId}`,
+          l1Tokens: leaf.l1Tokens,
+          netSendAmounts: leaf.netSendAmounts,
+        });
+      }
+    }
+    return executableLeaves;
   }
 
   async _executePoolRebalanceLeaves(
     spokePoolClients: {
       [chainId: number]: SpokePoolClient;
     },
-    leaves: PoolRebalanceLeaf[],
+    allLeaves: PoolRebalanceLeaf[],
     balanceAllocator: BalanceAllocator,
     tree: MerkleTree<PoolRebalanceLeaf>,
     submitExecution: boolean
   ): Promise<number> {
     const hubPoolChainId = this.clients.hubPoolClient.chainId;
-    const fundedLeaves = (
-      await Promise.all(
-        leaves.map(async (leaf) => {
-          const requests = leaf.netSendAmounts.map((amount, i) => ({
-            amount: amount.gt(bnZero) ? amount : bnZero,
-            tokens: [leaf.l1Tokens[i]],
-            holder: this.clients.hubPoolClient.hubPool.address,
-            chainId: hubPoolChainId,
-          }));
+    const signer = this.clients.hubPoolClient.hubPool.signer;
 
-          if (sdkUtils.chainIsArbitrum(leaf.chainId)) {
-            const hubPoolBalance = await this.clients.hubPoolClient.hubPool.provider.getBalance(
-              this.clients.hubPoolClient.hubPool.address
-            );
-            if (hubPoolBalance.lt(this._getRequiredEthForArbitrumPoolRebalanceLeaf(leaf))) {
-              requests.push({
-                tokens: [ZERO_ADDRESS],
-                amount: this._getRequiredEthForArbitrumPoolRebalanceLeaf(leaf),
-                holder: await this.clients.hubPoolClient.hubPool.signer.getAddress(),
-                chainId: hubPoolChainId,
-              });
-            }
-          }
+    // Evaluate leaves iteratively because we will be modifying virtual balances and we want
+    // to make sure we are getting the virtual balance computations correct.
+    const fundedLeaves = await this._getExecutablePoolRebalanceLeaves(allLeaves, balanceAllocator);
+    const executableLeaves: PoolRebalanceLeaf[] = [];
+    for (const leaf of fundedLeaves) {
+      // For orbit leaves we need to check if we have enough gas tokens to pay for the L1 to L2 message.
+      if (!sdkUtils.chainIsArbitrum(leaf.chainId) && !sdkUtils.chainIsOrbit(leaf.chainId)) {
+        executableLeaves.push(leaf);
+        continue;
+      }
 
-          const success = await balanceAllocator.requestBalanceAllocations(
-            requests.filter((req) => req.amount.gt(bnZero))
-          );
-
-          if (!success) {
-            // Note: this is an error because the HubPool should generally not run out of funds to put into
-            // netSendAmounts. This means that no new bundles can be proposed until this leaf is funded.
+      // Check if orbit leaf can be executed.
+      const {
+        amount: requiredAmount,
+        token: feeToken,
+        holder,
+      } = await this._getRequiredEthForOrbitPoolRebalanceLeaf(leaf);
+      const feeData = {
+        tokens: [feeToken],
+        amount: requiredAmount,
+        chainId: hubPoolChainId,
+      };
+      const success = await balanceAllocator.requestBalanceAllocations([{ ...feeData, holder }]);
+      if (!success) {
+        this.logger.debug({
+          at: "Dataworker#_executePoolRebalanceLeaves",
+          message: `Loading more orbit gas token to pay for L1->L2 message submission fees to ${getNetworkName(
+            leaf.chainId
+          )} 📨!`,
+          leaf,
+          feeToken,
+          requiredAmount,
+        });
+        if (submitExecution) {
+          const canFund = await balanceAllocator.requestBalanceAllocations([
+            { ...feeData, holder: await signer.getAddress() },
+          ]);
+          if (!canFund) {
             this.logger.error({
-              at: "Dataworker#executePoolRebalanceLeaves",
-              message: "Not executing pool rebalance leaf on HubPool due to lack of funds to send.",
-              root: tree.getHexRoot(),
-              leafId: leaf.leafId,
-              rebalanceChain: leaf.chainId,
-              token: leaf.l1Tokens,
-              netSendAmounts: leaf.netSendAmounts,
+              at: "Dataworker#_executePoolRebalanceLeaves",
+              message: `Failed to fund ${requiredAmount.toString()} of orbit gas token ${feeToken} for message to ${getNetworkName(
+                leaf.chainId
+              )}!`,
             });
-          } else {
-            // Add balances to spoke pool on mainnet since we know it will be sent atomically.
-            if (leaf.chainId === hubPoolChainId) {
-              await Promise.all(
-                leaf.netSendAmounts.map(async (amount, i) => {
-                  if (amount.gt(bnZero)) {
-                    await balanceAllocator.addUsed(
-                      leaf.chainId,
-                      leaf.l1Tokens[i],
-                      spokePoolClients[leaf.chainId].spokePool.address,
-                      amount.mul(-1)
-                    );
-                  }
-                })
-              );
-            }
+            continue;
           }
-          return success ? leaf : undefined;
-        })
-      )
-    ).filter(isDefined);
-
-    let hubPoolBalance;
-    if (fundedLeaves.some((leaf) => sdkUtils.chainIsArbitrum(leaf.chainId))) {
-      hubPoolBalance = await this.clients.hubPoolClient.hubPool.provider.getBalance(
-        this.clients.hubPoolClient.hubPool.address
-      );
-    }
-    fundedLeaves.forEach((leaf) => {
-      const proof = tree.getHexProof(leaf);
-      const mrkdwn = `Root hash: ${tree.getHexRoot()}\nLeaf: ${leaf.leafId}\nChain: ${leaf.chainId}`;
-      if (submitExecution) {
-        if (sdkUtils.chainIsArbitrum(leaf.chainId)) {
-          if (hubPoolBalance.lt(this._getRequiredEthForArbitrumPoolRebalanceLeaf(leaf))) {
+          if (feeToken === ZERO_ADDRESS) {
             this.clients.multiCallerClient.enqueueTransaction({
               contract: this.clients.hubPoolClient.hubPool,
               chainId: hubPoolChainId,
               method: "loadEthForL2Calls",
               args: [],
               message: `Loaded ETH for message to ${getNetworkName(leaf.chainId)} 📨!`,
-              mrkdwn,
-              value: this._getRequiredEthForArbitrumPoolRebalanceLeaf(leaf),
+              mrkdwn: `Root hash: ${tree.getHexRoot()}\nLeaf: ${leaf.leafId}\nChain: ${leaf.chainId}`,
+              value: requiredAmount,
+            });
+          } else {
+            // We can't call multicall() here because the feeToken is not guaranteed to be a Multicaller
+            // contract and this is a permissioned function where the msg.sender needs to be the
+            // feeToken balance owner, so we can't simply set `unpermissioned: true` to send it through the Multisender.
+            // Instead, we need to set `nonMulticall: true` and avoid batch calling this transaction.
+            this.clients.multiCallerClient.enqueueTransaction({
+              contract: new Contract(feeToken, ERC20.abi, signer),
+              chainId: hubPoolChainId,
+              nonMulticall: true,
+              method: "transfer",
+              args: [holder, requiredAmount],
+              message: `Loaded orbit gas token for message to ${getNetworkName(leaf.chainId)} 📨!`,
+              mrkdwn: `Root hash: ${tree.getHexRoot()}\nLeaf: ${leaf.leafId}\nChain: ${leaf.chainId}`,
             });
           }
         }
+      } else {
+        this.logger.debug({
+          at: "Dataworker#_executePoolRebalanceLeaves",
+          message: `feePayer ${holder} has sufficient orbit gas token to pay for L1->L2 message submission fees to ${getNetworkName(
+            leaf.chainId
+          )}`,
+          feeToken,
+          requiredAmount,
+          feePayerBalance: await balanceAllocator.getBalanceSubUsed(hubPoolChainId, feeToken, holder),
+        });
+      }
+      executableLeaves.push(leaf);
+    }
+
+    // Execute the leaves:
+    executableLeaves.forEach((leaf) => {
+      // Add balances to spoke pool on mainnet since we know it will be sent atomically.
+      if (leaf.chainId === hubPoolChainId) {
+        leaf.netSendAmounts.forEach((amount, i) => {
+          if (amount.gt(bnZero)) {
+            balanceAllocator.addUsed(
+              leaf.chainId,
+              leaf.l1Tokens[i],
+              spokePoolClients[leaf.chainId].spokePool.address,
+              amount.mul(-1)
+            );
+          }
+        });
+      }
+      const mrkdwn = `Root hash: ${tree.getHexRoot()}\nLeaf: ${leaf.leafId}\nChain: ${leaf.chainId}`;
+      if (submitExecution) {
         this.clients.multiCallerClient.enqueueTransaction({
           contract: this.clients.hubPoolClient.hubPool,
           chainId: hubPoolChainId,
@@ -1616,9 +1753,9 @@ export class Dataworker {
             leaf.runningBalances,
             leaf.leafId,
             leaf.l1Tokens,
-            proof,
+            tree.getHexProof(leaf),
           ],
-          message: "Executed PoolRebalanceLeaf 🌿!",
+          message: `Executed PoolRebalanceLeaf for chain ${leaf.chainId} 🌿!`,
           mrkdwn,
           unpermissioned: true,
           // If simulating execution of leaves for non-mainnet chains, can fail as it may require funds to be returned
@@ -1626,39 +1763,33 @@ export class Dataworker {
           canFailInSimulation: leaf.chainId !== hubPoolChainId,
         });
       } else {
-        this.logger.debug({ at: "Dataworker#executePoolRebalanceLeaves", message: mrkdwn });
+        this.logger.debug({ at: "Dataworker#_executePoolRebalanceLeaves", message: mrkdwn });
       }
     });
-    return fundedLeaves.length;
+
+    return executableLeaves.length;
   }
 
   async _updateExchangeRatesBeforeExecutingHubChainLeaves(
+    balanceAllocator: BalanceAllocator,
     poolRebalanceLeaf: Pick<PoolRebalanceLeaf, "netSendAmounts" | "l1Tokens">,
     submitExecution: boolean
   ): Promise<Record<string, BigNumber>> {
     const hubPool = this.clients.hubPoolClient.hubPool;
     const chainId = this.clients.hubPoolClient.chainId;
 
-    const updatedL1Tokens: Record<string, BigNumber> = {};
+    const updatedLiquidReserves: Record<string, BigNumber> = {};
     const { netSendAmounts, l1Tokens } = poolRebalanceLeaf;
     await sdk.utils.forEachAsync(l1Tokens, async (l1Token, idx) => {
+      const currentLiquidReserves = this.clients.hubPoolClient.getLpTokenInfoForL1Token(l1Token)?.liquidReserves;
+      updatedLiquidReserves[l1Token] = currentLiquidReserves;
+      assert(currentLiquidReserves !== undefined && currentLiquidReserves.gte(0), "Liquid reserves should be >= 0");
       const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(chainId, l1Token)?.symbol;
 
       // If netSendAmounts is negative, there is no need to update this exchange rate.
       if (netSendAmounts[idx].lte(0)) {
         return;
       }
-
-      const multicallInput = [
-        hubPool.interface.encodeFunctionData("pooledTokens", [l1Token]),
-        hubPool.interface.encodeFunctionData("sync", [l1Token]),
-        hubPool.interface.encodeFunctionData("pooledTokens", [l1Token]),
-      ];
-      const multicallOutput = await hubPool.callStatic.multicall(multicallInput);
-      const currentPooledTokens = hubPool.interface.decodeFunctionResult("pooledTokens", multicallOutput[0]);
-      const updatedPooledTokens = hubPool.interface.decodeFunctionResult("pooledTokens", multicallOutput[2]);
-      const currentLiquidReserves = currentPooledTokens.liquidReserves;
-      const updatedLiquidReserves = updatedPooledTokens.liquidReserves;
 
       // If current liquid reserves can cover the netSendAmount, then there is no need to update the exchange rate.
       if (currentLiquidReserves.gte(netSendAmounts[idx])) {
@@ -1669,45 +1800,47 @@ export class Dataworker {
           netSendAmount: netSendAmounts[idx],
           l1Token,
         });
+        updatedLiquidReserves[l1Token] = currentLiquidReserves.sub(netSendAmounts[idx]);
         return;
       }
 
-      // If updated liquid reserves are not enough to cover the payment, then send a warning that
-      // we're short on funds.
-      if (updatedLiquidReserves.lt(netSendAmounts[idx])) {
-        this.logger.error({
+      // @dev: post-sync liquid reserves should be equal to ERC20 balanceOf the HubPool.
+      const postSyncLiquidReserves = await balanceAllocator.getBalanceSubUsed(chainId, l1Token, hubPool.address);
+
+      // If updated liquid reserves are not enough to cover the payment, then send an error log that
+      // we're short on funds. Otherwise, enqueue a sync() call and then update the availableLiquidReserves.
+      if (postSyncLiquidReserves.lt(netSendAmounts[idx])) {
+        this.logger.warn({
           at: "Dataworker#_updateExchangeRatesBeforeExecutingHubChainLeaves",
-          message: `Not enough funds to execute pool rebalance leaf on HubPool for token: ${tokenSymbol}`,
-          poolRebalanceLeaf,
+          message: `Not enough funds to execute Ethereum pool rebalance leaf on HubPool for token: ${tokenSymbol}`,
           netSendAmount: netSendAmounts[idx],
-          currentPooledTokens,
-          updatedPooledTokens,
+          currentLiquidReserves,
+          postSyncLiquidReserves,
         });
-        return;
-      }
-
-      this.logger.debug({
-        at: "Dataworker#_updateExchangeRatesBeforeExecutingHubChainLeaves",
-        message: `Updating exchange rate update for ${tokenSymbol} because we need to update the liquid reserves of the contract to execute the hubChain poolRebalanceLeaf.`,
-        poolRebalanceLeaf,
-        netSendAmount: netSendAmounts[idx],
-        currentPooledTokens,
-        updatedPooledTokens,
-      });
-      updatedL1Tokens[l1Token] = updatedPooledTokens.liquidReserves;
-      if (submitExecution) {
-        this.clients.multiCallerClient.enqueueTransaction({
-          contract: hubPool,
-          chainId,
-          method: "exchangeRateCurrent",
-          args: [l1Token],
-          message: "Updated exchange rate ♻️!",
-          mrkdwn: `Updated exchange rate for l1 token: ${tokenSymbol}`,
-          unpermissioned: true,
+      } else {
+        // At this point, we can assume that the liquid reserves increased post-sync so we'll enqueue an update.
+        updatedLiquidReserves[l1Token] = postSyncLiquidReserves.sub(netSendAmounts[idx]);
+        this.logger.debug({
+          at: "Dataworker#_updateExchangeRatesBeforeExecutingHubChainLeaves",
+          message: `Updating exchange rate for ${tokenSymbol} because we need to update the liquid reserves of the contract to execute the hubChain poolRebalanceLeaf.`,
+          netSendAmount: netSendAmounts[idx],
+          currentLiquidReserves,
+          postSyncLiquidReserves,
         });
+        if (submitExecution) {
+          this.clients.multiCallerClient.enqueueTransaction({
+            contract: hubPool,
+            chainId,
+            method: "exchangeRateCurrent",
+            args: [l1Token],
+            message: "Updated exchange rate ♻️!",
+            mrkdwn: `Updated exchange rate for l1 token: ${tokenSymbol}`,
+            unpermissioned: true,
+          });
+        }
       }
     });
-    return updatedL1Tokens;
+    return updatedLiquidReserves;
   }
 
   async _updateExchangeRatesBeforeExecutingNonHubChainLeaves(
@@ -1720,81 +1853,103 @@ export class Dataworker {
     const hubPool = this.clients.hubPoolClient.hubPool;
     const hubPoolChainId = this.clients.hubPoolClient.chainId;
 
+    const aggregateNetSendAmounts: Record<string, BigNumber> = {};
+
     await sdkUtils.forEachAsync(poolRebalanceLeaves, async (leaf) => {
       await sdkUtils.forEachAsync(leaf.l1Tokens, async (l1Token, idx) => {
-        const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(hubPoolChainId, l1Token)?.symbol;
+        aggregateNetSendAmounts[l1Token] ??= bnZero;
 
-        if (updatedL1Tokens.has(l1Token)) {
-          return;
-        }
         // If leaf's netSendAmount is negative, then we don't need to updateExchangeRates since the Hub will not
         // have a liquidity constraint because it won't be sending any tokens.
         if (leaf.netSendAmounts[idx].lte(0)) {
           return;
         }
-        // The "used" balance kept in the BalanceAllocator should have adjusted for the netSendAmounts and relayer refund leaf
-        // executions above. Therefore, check if the current liquidReserves is less than the pool rebalance leaf's netSendAmount
-        // and the virtual hubPoolBalance would be enough to execute it. If so, then add an update exchange rate call to make sure that
-        // the HubPool becomes "aware" of its inflow following the relayre refund leaf execution.
-        let currHubPoolLiquidReserves = latestLiquidReserves[l1Token];
-        if (!currHubPoolLiquidReserves) {
-          // @dev If there aren't liquid reserves for this token then set them to max value so we won't update them.
-          currHubPoolLiquidReserves = this.clients.hubPoolClient.getLpTokenInfoForL1Token(l1Token).liquidReserves;
-        }
-        assert(currHubPoolLiquidReserves !== undefined);
-        // We only need to update the exchange rate in the case where tokens are returned to the HubPool increasing
-        // its balance enough that it can execute a pool rebalance leaf it otherwise would not be able to.
-        // This would only happen if the starting hub pool balance is below the net send amount. If it started
-        // above, then the dataworker would not purposefully send tokens out of it to fulfill the Ethereum
-        // PoolRebalanceLeaf and then return tokens to it to execute another chain's PoolRebalanceLeaf.
-        if (currHubPoolLiquidReserves.gte(leaf.netSendAmounts[idx])) {
-          this.logger.debug({
-            at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
-            message: `Skipping exchange rate update for ${tokenSymbol} because current liquid reserves > netSendAmount for chain ${leaf.chainId}`,
-            l2ChainId: leaf.chainId,
-            currHubPoolLiquidReserves,
-            netSendAmount: leaf.netSendAmounts[idx],
-            l1Token,
-          });
-          return;
-        }
-
-        // @dev: Virtual balance = post-sync liquid reserves + any used balance.
-        const multicallInput = [
-          hubPool.interface.encodeFunctionData("sync", [l1Token]),
-          hubPool.interface.encodeFunctionData("pooledTokens", [l1Token]),
-        ];
-        const multicallOutput = await hubPool.callStatic.multicall(multicallInput);
-        const updatedPooledTokens = hubPool.interface.decodeFunctionResult("pooledTokens", multicallOutput[1]);
-        const updatedLiquidReserves = updatedPooledTokens.liquidReserves;
-        const virtualHubPoolBalance = updatedLiquidReserves.sub(
-          balanceAllocator.getUsed(hubPoolChainId, l1Token, hubPool.address)
-        );
-
-        // If the virtual balance is still too low to execute the pool leaf, then log an error that this will
-        // pool rebalance leaf execution will fail.
-        if (virtualHubPoolBalance.lt(leaf.netSendAmounts[idx])) {
-          this.logger.error({
-            at: "Dataworker#executePoolRebalanceLeaves",
-            message: "Executing pool rebalance leaf on HubPool will fail due to lack of funds to send.",
-            leaf: leaf,
-            l1Token,
-            netSendAmount: leaf.netSendAmounts[idx],
-            updatedLiquidReserves,
-            virtualHubPoolBalance,
-          });
-          return;
-        }
-        this.logger.debug({
-          at: "Dataworker#executePoolRebalanceLeaves",
-          message: `Relayer refund leaf will return enough funds to HubPool to execute PoolRebalanceLeaf, updating exchange rate for ${tokenSymbol}`,
-          updatedLiquidReserves,
-          virtualHubPoolBalance,
-          netSendAmount: leaf.netSendAmounts[idx],
-          leaf,
-        });
-        updatedL1Tokens.add(l1Token);
+        aggregateNetSendAmounts[l1Token] = aggregateNetSendAmounts[l1Token].add(leaf.netSendAmounts[idx]);
       });
+    });
+
+    // Now, go through each L1 token and see if we need to update the exchange rate for it.
+    await sdkUtils.forEachAsync(Object.keys(aggregateNetSendAmounts), async (l1Token) => {
+      const currHubPoolLiquidReserves =
+        latestLiquidReserves[l1Token] ?? this.clients.hubPoolClient.getLpTokenInfoForL1Token(l1Token)?.liquidReserves;
+      assert(
+        currHubPoolLiquidReserves !== undefined && currHubPoolLiquidReserves.gte(0),
+        "Liquid reserves should be >= 0"
+      );
+
+      const requiredNetSendAmountForL1Token = aggregateNetSendAmounts[l1Token];
+      // If netSendAmounts is 0, there is no need to update this exchange rate.
+      assert(requiredNetSendAmountForL1Token.gte(0), "Aggregate net send amount should be >= 0");
+      if (requiredNetSendAmountForL1Token.eq(0)) {
+        return;
+      }
+
+      const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(hubPoolChainId, l1Token)?.symbol;
+      if (currHubPoolLiquidReserves.gte(requiredNetSendAmountForL1Token)) {
+        this.logger.debug({
+          at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
+          message: `Skipping exchange rate update for ${tokenSymbol} because current liquid reserves > required netSendAmount for non-hubChain pool leaves`,
+          leavesWithNetSendAmountRequirementsFromHubPoolLiquidReserves: Object.fromEntries(
+            poolRebalanceLeaves
+              .filter((leaf) => {
+                const l1TokenIndex = leaf.l1Tokens.indexOf(l1Token);
+                if (l1TokenIndex === -1) {
+                  return false;
+                }
+                const netSendAmount = leaf.netSendAmounts[l1TokenIndex];
+                return netSendAmount.gt(0);
+              })
+              .map((leaf) => [leaf.chainId, leaf.netSendAmounts[leaf.l1Tokens.indexOf(l1Token)]])
+          ),
+          currHubPoolLiquidReserves,
+          requiredNetSendAmountForL1Token,
+          l1Token,
+        });
+        return;
+      }
+
+      // Current liquid reserves are insufficient to execute aggregate net send amount for this token so
+      // look at the updated liquid reserves post-sync. This will be equal the ERC20 balanceOf the hub pool
+      // including any netSendAmounts used in a prior pool leaf execution.
+      const updatedLiquidReserves = await balanceAllocator.getBalanceSubUsed(hubPoolChainId, l1Token, hubPool.address);
+
+      // If the post-sync balance is still too low to execute all the pool leaves, then log an error
+      if (updatedLiquidReserves.lt(requiredNetSendAmountForL1Token)) {
+        this.logger.warn({
+          at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
+          message: `Not enough funds to execute ALL non-Ethereum pool rebalance leaf on HubPool for token: ${tokenSymbol}, updating exchange rate anyways to try to execute as many leaves as possible`,
+          l1Token,
+          requiredNetSendAmountForL1Token,
+          currHubPoolLiquidReserves,
+          updatedLiquidReserves,
+        });
+      } else {
+        this.logger.debug({
+          at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
+          message: `Post-sync liquid reserves are sufficient to execute PoolRebalanceLeaf, updating exchange rate for ${tokenSymbol}`,
+          l1Token,
+          requiredNetSendAmountForL1Token,
+          currHubPoolLiquidReserves,
+          updatedLiquidReserves,
+        });
+      }
+
+      // We don't know yet which leaves we can execute so we'll update the exchange rate for this token even if
+      // some leaves might not be executable.
+      // TODO: Be more precise about whether updating this l1 token is worth it. For example, if we update this l1
+      // token and its reserves increase, depending on which other tokens are contained in the pool rebalance leaf
+      // with this token, increasing this token's reserves might not help us execute those leaves.
+      if (updatedLiquidReserves.gt(currHubPoolLiquidReserves)) {
+        updatedL1Tokens.add(l1Token);
+      } else {
+        this.logger.debug({
+          at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
+          message: `Skipping exchange rate update for ${tokenSymbol} because liquid reserves would not increase`,
+          currHubPoolLiquidReserves,
+          updatedLiquidReserves,
+          l1Token,
+        });
+      }
     });
 
     // Submit executions at the end since the above double loop runs in parallel and we don't want to submit
@@ -1956,26 +2111,19 @@ export class Dataworker {
         const blockNumberRanges = getImpliedBundleBlockRanges(hubPoolClient, configStoreClient, matchingRootBundle);
         const mainnetBlockRanges = blockNumberRanges[0];
         const chainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(mainnetBlockRanges[0]);
-        if (
-          Object.keys(earliestBlocksInSpokePoolClients).length > 0 &&
-          (await blockRangesAreInvalidForSpokeClients(
-            spokePoolClients,
-            blockNumberRanges,
-            chainIds,
-            earliestBlocksInSpokePoolClients,
-            this.isV3(mainnetBlockRanges[0])
-          ))
-        ) {
+        const invalidBlockRanges = await this._validateBlockRanges(
+          spokePoolClients,
+          blockNumberRanges,
+          chainIds,
+          earliestBlocksInSpokePoolClients,
+          this.isV3(mainnetBlockRanges[0])
+        );
+        if (invalidBlockRanges.length > 0) {
           this.logger.warn({
             at: "Dataworke#executeRelayerRefundLeaves",
             message: "Cannot validate bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
-            chainId,
-            rootBundleRanges: blockNumberRanges,
-            availableSpokePoolClients: Object.keys(spokePoolClients),
-            earliestBlocksInSpokePoolClients,
-            spokeClientsEventSearchConfigs: Object.fromEntries(
-              Object.entries(spokePoolClients).map(([chainId, client]) => [chainId, client.eventSearchConfig])
-            ),
+            invalidBlockRanges,
+            bundleTxn: matchingRootBundle.transactionHash,
           });
           continue;
         }
@@ -2111,15 +2259,27 @@ export class Dataworker {
           const success = await balanceAllocator.requestBalanceAllocations(balanceRequestsToQuery);
           if (!success) {
             this.logger.warn({
-              at: "Dataworker#executeRelayerRefundLeaves",
-              message: "Not executing relayer refund leaf on SpokePool due to lack of funds.",
+              at: "Dataworker#_executeRelayerRefundLeaves",
+              message: `Not executing relayer refund leaf on chain ${leaf.chainId} due to lack of spoke or msg.sender funds for token ${l1TokenInfo?.symbol}`,
               root: relayerRefundTree.getHexRoot(),
               bundle: rootBundleId,
               leafId: leaf.leafId,
-              token: l1TokenInfo?.symbol,
-              chainId: leaf.chainId,
               amountToReturn: leaf.amountToReturn,
-              refunds: leaf.refundAmounts,
+              totalRefundAmount: leaf.refundAmounts.reduce((acc, curr) => acc.add(curr), BigNumber.from(0)),
+              spokeBalance: await this._getSpokeBalanceForL2Tokens(
+                balanceAllocator,
+                leaf.chainId,
+                leaf.l2TokenAddress,
+                client.spokePool.address
+              ),
+              requiredEthValue: valueToPassViaPayable,
+              senderEthValue:
+                valueToPassViaPayable &&
+                (await balanceAllocator.getBalanceSubUsed(
+                  leaf.chainId,
+                  ZERO_ADDRESS,
+                  await client.spokePool.signer.getAddress()
+                )),
             });
           } else {
             // If mainnet leaf, then allocate balance to the HubPool since it will be atomically transferred.
@@ -2156,13 +2316,13 @@ export class Dataworker {
           mrkdwn,
           // If mainnet, send through Multicall3 so it can be batched with PoolRebalanceLeaf executions, otherwise
           // SpokePool.multicall() is fine.
-          unpermissioned: Number(chainId) === CHAIN_IDs.MAINNET,
+          unpermissioned: Number(chainId) === this.clients.hubPoolClient.chainId,
           // If simulating mainnet execution, can fail as it may require funds to be sent from
           // pool rebalance leaf.
           canFailInSimulation: leaf.chainId === this.clients.hubPoolClient.chainId,
         });
       } else {
-        this.logger.debug({ at: "Dataworker#executeRelayerRefundLeaves", message: mrkdwn });
+        this.logger.debug({ at: "Dataworker#_executeRelayerRefundLeaves", message: mrkdwn });
       }
     });
   }
@@ -2174,7 +2334,7 @@ export class Dataworker {
     poolRebalanceRoot: string,
     relayerRefundLeaves: RelayerRefundLeaf[],
     relayerRefundRoot: string,
-    slowRelayLeaves: V3SlowFillLeaf[],
+    slowRelayLeaves: SlowFillLeaf[],
     slowRelayRoot: string
   ): void {
     try {
@@ -2229,7 +2389,20 @@ export class Dataworker {
     }
   }
 
-  async _getPoolRebalanceRoot(
+  _getSpokeBalanceForL2Tokens(
+    balanceAllocator: BalanceAllocator,
+    chainId: number,
+    token: string,
+    holder: string
+  ): Promise<BigNumber> {
+    return sdkUtils.reduceAsync(
+      l2TokensToCountTowardsSpokePoolLeafExecutionCapital(token, chainId),
+      async (acc, token) => acc.add(await balanceAllocator.getBalanceSubUsed(chainId, token, holder)),
+      bnZero
+    );
+  }
+
+  _getPoolRebalanceRoot(
     blockRangesForChains: number[][],
     latestMainnetBlock: number,
     mainnetBundleEndBlock: number,
@@ -2238,7 +2411,7 @@ export class Dataworker {
     bundleSlowFills: BundleSlowFills,
     unexecutableSlowFills: BundleExcessSlowFills,
     expiredDepositsToRefundV3: ExpiredDepositsToRefundV3
-  ): Promise<PoolRebalanceRoot> {
+  ): PoolRebalanceRoot {
     const key = JSON.stringify(blockRangesForChains);
     // FIXME: Temporary fix to disable root cache rebalancing and to keep the
     //        executor running for tonight (2023-08-28) until we can fix the
@@ -2258,24 +2431,66 @@ export class Dataworker {
       );
     }
 
-    return _.cloneDeep(await this.rootCache[key]);
+    this.logger.debug({
+      at: "Dataworker#_getPoolRebalanceRoot",
+      message: "Constructed new pool rebalance root",
+      key,
+      root: {
+        ...this.rootCache[key],
+        tree: this.rootCache[key].tree.getHexRoot(),
+      },
+    });
+
+    return _.cloneDeep(this.rootCache[key]);
   }
 
-  _getRequiredEthForArbitrumPoolRebalanceLeaf(leaf: PoolRebalanceLeaf): BigNumber {
-    // For arbitrum, the bot needs enough ETH to pay for each L1 -> L2 message.
+  async _getRequiredEthForOrbitPoolRebalanceLeaf(leaf: PoolRebalanceLeaf): Promise<{
+    amount: BigNumber;
+    token: string;
+    holder: string;
+  }> {
+    // TODO: Make this code more dynamic in the future. For now, hard code custom gas token fees.
+    let relayMessageFee: BigNumber;
+    let token: string;
+    let holder: string;
+    if (leaf.chainId === CHAIN_IDs.ALEPH_ZERO) {
+      // Unlike when handling native ETH, the monitor bot does NOT support sending arbitrary ERC20 tokens to any other
+      // EOA, so if we're short a custom gas token like AZERO, then we're going to have to keep sending over token
+      // amounts to the DonationBox contract. Therefore, we'll multiply the final amount by 10 to ensure we don't incur
+      // a transfer() gas cost on every single pool rebalance leaf execution involving this arbitrum orbit chain.
+      const { amountWei, feePayer, feeToken, amountMultipleToFund } =
+        ARBITRUM_ORBIT_L1L2_MESSAGE_FEE_DATA[CHAIN_IDs.ALEPH_ZERO];
+      relayMessageFee = toBNWei(amountWei).mul(amountMultipleToFund);
+      token = feeToken;
+      holder = feePayer;
+    } else {
+      // For now, assume arbitrum message fees are the same for all non-custom gas token chains. This obviously needs
+      // to be changed if we add support for an orbit chains where we pay message fees in ETH but they are different
+      // parameters than for Arbitrum mainnet.
+      const { amountWei, amountMultipleToFund } = ARBITRUM_ORBIT_L1L2_MESSAGE_FEE_DATA[CHAIN_IDs.ARBITRUM];
+      relayMessageFee = toBNWei(amountWei).mul(amountMultipleToFund);
+      token = ZERO_ADDRESS;
+      holder = this.clients.hubPoolClient.hubPool.address;
+    }
+
+    // For orbit chains, the bot needs enough ETH to pay for each L1 -> L2 message.
     // The following executions trigger an L1 -> L2 message:
-    // 1. The first arbitrum leaf for a particular set of roots. This means the roots must be sent and is
+    // 1. The first orbit leaf for a particular set of roots. This means the roots must be sent and is
     //    signified by groupIndex === 0.
     // 2. Any netSendAmount > 0 triggers an L1 -> L2 token send, which costs 0.02 ETH.
     let requiredAmount = leaf.netSendAmounts.reduce(
-      (acc, curr) => (curr.gt(0) ? acc.add(toBNWei("0.02")) : acc),
+      (acc, curr) => (curr.gt(0) ? acc.add(relayMessageFee) : acc),
       BigNumber.from(0)
     );
 
     if (leaf.groupIndex === 0) {
-      requiredAmount = requiredAmount.add(toBNWei("0.02"));
+      requiredAmount = requiredAmount.add(relayMessageFee);
     }
-    return requiredAmount;
+    return {
+      amount: requiredAmount,
+      token,
+      holder,
+    };
   }
 
   /**
@@ -2333,7 +2548,7 @@ export class Dataworker {
     mainnetBundleStartBlock: number
   ): number[][] {
     const chainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(mainnetBundleStartBlock);
-    return PoolRebalanceUtils.getWidestPossibleExpectedBlockRange(
+    return getWidestPossibleExpectedBlockRange(
       // We only want as many block ranges as there are chains enabled at the time of the bundle start block.
       chainIds,
       spokePoolClients,
@@ -2343,5 +2558,25 @@ export class Dataworker {
       // We only want to count enabled chains at the same time that we are loading chain ID indices.
       this.clients.configStoreClient.getEnabledChains(mainnetBundleStartBlock)
     );
+  }
+
+  async _validateBlockRanges(
+    spokePoolClients: SpokePoolClientsByChain,
+    blockRanges: number[][],
+    chainIds: number[],
+    earliestBlocksInSpokePoolClients: { [chainId: number]: number },
+    isV3: boolean
+  ): Promise<InvalidBlockRange[]> {
+    return await blockRangesAreInvalidForSpokeClients(
+      spokePoolClients,
+      blockRanges,
+      chainIds,
+      earliestBlocksInSpokePoolClients,
+      isV3
+    );
+  }
+
+  _prettifyBundleBlockRanges(chainIds: number[], blockRanges: number[][]): Record<number, number[]> {
+    return Object.fromEntries(chainIds.map((chainId, i) => [chainId, blockRanges[i]]));
   }
 }

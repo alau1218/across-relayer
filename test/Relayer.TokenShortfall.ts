@@ -55,7 +55,7 @@ describe("Relayer: Token balance shortfall", async function () {
   let spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let configStoreClient: ConfigStoreClient, hubPoolClient: HubPoolClient, tokenClient: TokenClient;
   let relayerInstance: Relayer;
-  let multiCallerClient: MultiCallerClient, profitClient: MockProfitClient;
+  let multiCallerClient: MultiCallerClient, tryMulticallClient: MultiCallerClient, profitClient: MockProfitClient;
   let spokePool1DeploymentBlock: number, spokePool2DeploymentBlock: number;
 
   let inputToken: string, outputToken: string;
@@ -113,6 +113,7 @@ describe("Relayer: Token balance shortfall", async function () {
     await hubPoolClient.update();
 
     multiCallerClient = new MockedMultiCallerClient(spyLogger); // leave out the gasEstimator for now.
+    tryMulticallClient = new MockedMultiCallerClient(spyLogger);
     spokePoolClient_1 = new SpokePoolClient(
       spyLogger,
       spokePool_1.connect(relayer),
@@ -157,11 +158,14 @@ describe("Relayer: Token balance shortfall", async function () {
           new MockCrossChainTransferClient()
         ),
         acrossApiClient: new AcrossApiClient(spyLogger, hubPoolClient, chainIds),
+        tryMulticallClient,
       },
       {
         relayerTokens: [],
         slowDepositors: [],
         minDepositConfirmations: defaultMinDepositConfirmations,
+        tryMulticallChains: [],
+        loggingInterval: -1,
       } as unknown as RelayerConfig
     );
 
@@ -225,7 +229,7 @@ describe("Relayer: Token balance shortfall", async function () {
     expect(txnHashes.length).to.equal(1);
     const txn = await spokePool_1.provider.getTransaction(txnHashes[0]);
     const { name: method, args } = spokePool_1.interface.parseTransaction(txn);
-    expect(method).to.equal("fillV3Relay");
+    expect(method).to.equal("fillRelay");
     expect(args[0].depositId).to.equal(0); // depositId 0
 
     expect(spyLogIncludes(spy, -5, `${await l1Token.symbol()} cumulative shortfall of 190.00`)).to.be.true;

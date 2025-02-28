@@ -1,7 +1,7 @@
 import { utils as sdkUtils } from "@across-protocol/sdk";
-import { BigNumber } from "ethers";
-import { DEFAULT_MULTICALL_CHUNK_SIZE, DEFAULT_CHAIN_MULTICALL_CHUNK_SIZE, Multicall2Call } from "../common";
+import { DEFAULT_MULTICALL_CHUNK_SIZE } from "../common";
 import {
+  BigNumber,
   winston,
   bnZero,
   getNetworkName,
@@ -14,6 +14,8 @@ import {
   Signer,
   getMultisender,
   getProvider,
+  Multicall2Call,
+  assert,
 } from "../utils";
 import { AugmentedTransaction, TransactionClient } from "./TransactionClient";
 import lodash from "lodash";
@@ -30,6 +32,7 @@ export const knownRevertReasons = new Set([
   "relay filled",
   "Already claimed",
   "RelayFilled",
+  "NotExclusiveRelayer",
   "ClaimedMerkleLeaf",
   "InvalidSlowFillRequest",
 ]);
@@ -48,9 +51,8 @@ export const unknownRevertReasonMethodsToIgnore = new Set([
   "fillRelay",
   "fillRelayWithUpdatedFee",
   "fillV3Relay",
-  "fillV3RelayWithUpdatedDeposit",
-  "requestV3SlowFill",
-  "executeV3SlowRelayLeaf",
+  "fillRelayWithUpdatedDeposit",
+  "requestSlowFill",
   "executeSlowRelayLeaf",
   "executeRelayerRefundLeaf",
   "executeRootBundle",
@@ -64,13 +66,23 @@ export const unknownRevertReasonMethodsToIgnore = new Set([
 //      See also https://community.optimism.io/docs/developers/bedrock/differences/
 const MULTICALL3_AGGREGATE_GAS_MULTIPLIER = 1.5;
 
+// The below interface is used by the TryMulticallClient to store information about successfully simulated transactions.
+// A tryMulticall call returns information about whether or not each individual transaction within the bundle succeeds.
+// If some but not all individual transactions in the bundle succeed, then we store that information in this interface
+// so that we may rebuild a tryMulticall bundle without having to perform further simulations.
+export interface TryMulticallTransaction {
+  contract: Contract;
+  calldata: string[];
+  gasLimit: BigNumber;
+}
+
 export class MultiCallerClient {
   protected txnClient: TransactionClient;
   protected txns: { [chainId: number]: AugmentedTransaction[] } = {};
-  protected valueTxns: { [chainId: number]: AugmentedTransaction[] } = {};
+  protected nonMulticallTxns: { [chainId: number]: AugmentedTransaction[] } = {};
   constructor(
     readonly logger: winston.Logger,
-    readonly chunkSize: { [chainId: number]: number } = DEFAULT_CHAIN_MULTICALL_CHUNK_SIZE,
+    readonly chunkSize: { [chainId: number]: number } = {},
     readonly baseSigner?: Signer
   ) {
     this.txnClient = new TransactionClient(logger);
@@ -78,8 +90,8 @@ export class MultiCallerClient {
 
   getQueuedTransactions(chainId: number): AugmentedTransaction[] {
     const allTxns = [];
-    if (this.valueTxns?.[chainId]) {
-      allTxns.push(...this.valueTxns[chainId]);
+    if (this.nonMulticallTxns?.[chainId]) {
+      allTxns.push(...this.nonMulticallTxns[chainId]);
     }
     if (this.txns?.[chainId]) {
       allTxns.push(...this.txns[chainId]);
@@ -89,8 +101,8 @@ export class MultiCallerClient {
 
   // Adds all information associated with a transaction to the transaction queue.
   enqueueTransaction(txn: AugmentedTransaction): void {
-    // Value transactions are sorted immediately because the UMA multicall implementation rejects them.
-    const txnQueue = txn.value && txn.value.gt(0) ? this.valueTxns : this.txns;
+    // We do not attempt to batch together transactions that have value or are explicitly nonMulticall.
+    const txnQueue = (txn.value && txn.value.gt(0)) || txn.nonMulticall ? this.nonMulticallTxns : this.txns;
     if (txnQueue[txn.chainId] === undefined) {
       txnQueue[txn.chainId] = [];
     }
@@ -99,17 +111,17 @@ export class MultiCallerClient {
 
   transactionCount(): number {
     return Object.values(this.txns)
-      .concat(Object.values(this.valueTxns))
+      .concat(Object.values(this.nonMulticallTxns))
       .reduce((count, txnQueue) => (count += txnQueue.length), 0);
   }
 
   clearTransactionQueue(chainId: number | null = null): void {
     if (chainId !== null) {
       this.txns[chainId] = [];
-      this.valueTxns[chainId] = [];
+      this.nonMulticallTxns[chainId] = [];
     } else {
       this.txns = {};
-      this.valueTxns = {};
+      this.nonMulticallTxns = {};
     }
   }
 
@@ -117,7 +129,7 @@ export class MultiCallerClient {
   async executeTxnQueues(simulate = false, chainIds: number[] = []): Promise<Record<number, string[]>> {
     if (chainIds.length === 0) {
       chainIds = sdkUtils.dedupArray([
-        ...Object.keys(this.valueTxns).map(Number),
+        ...Object.keys(this.nonMulticallTxns).map(Number),
         ...Object.keys(this.txns).map(Number),
       ]);
     }
@@ -162,9 +174,9 @@ export class MultiCallerClient {
   // For a single chain, take any enqueued transactions and attempt to execute them.
   async executeTxnQueue(chainId: number, simulate = false): Promise<TransactionResponse[]> {
     const txns: AugmentedTransaction[] | undefined = this.txns[chainId];
-    const valueTxns: AugmentedTransaction[] | undefined = this.valueTxns[chainId];
+    const nonMulticallTxns: AugmentedTransaction[] | undefined = this.nonMulticallTxns[chainId];
     this.clearTransactionQueue(chainId);
-    return this._executeTxnQueue(chainId, txns, valueTxns, simulate);
+    return this._executeTxnQueue(chainId, txns, nonMulticallTxns, simulate);
   }
 
   // For a single chain, simulate all potential multicall txns and group the ones that pass into multicall bundles.
@@ -173,10 +185,10 @@ export class MultiCallerClient {
   protected async _executeTxnQueue(
     chainId: number,
     txns: AugmentedTransaction[] = [],
-    valueTxns: AugmentedTransaction[] = [],
+    nonMulticallTxns: AugmentedTransaction[] = [],
     simulate = false
   ): Promise<TransactionResponse[]> {
-    const nTxns = txns.length + valueTxns.length;
+    const nTxns = txns.length + nonMulticallTxns.length;
     if (nTxns === 0) {
       return [];
     }
@@ -192,7 +204,7 @@ export class MultiCallerClient {
     // First try to simulate the transaction as a batch. If the full batch succeeded, then we don't
     // need to simulate transactions individually. If the batch failed, then we need to
     // simulate the transactions individually and pick out the successful ones.
-    const batchTxns: AugmentedTransaction[] = valueTxns.concat(
+    const batchTxns: AugmentedTransaction[] = nonMulticallTxns.concat(
       await this.buildMultiCallBundles(txns, this.chunkSize[chainId])
     );
     const batchSimResults = await this.txnClient.simulate(batchTxns);
@@ -215,7 +227,7 @@ export class MultiCallerClient {
     } else {
       const individualTxnSimResults = await Promise.allSettled([
         this.simulateTransactionQueue(txns),
-        this.simulateTransactionQueue(valueTxns),
+        this.simulateTransactionQueue(nonMulticallTxns),
       ]);
       const [_txns, _valueTxns] = individualTxnSimResults.map((result): AugmentedTransaction[] => {
         return isPromiseFulfilled(result) ? result.value : [];
@@ -511,5 +523,138 @@ export class MultiCallerClient {
         notificationPath: "across-error",
       });
     }
+  }
+}
+
+export class TryMulticallClient extends MultiCallerClient {
+  override _buildMultiCallBundle(transactions: AugmentedTransaction[]): AugmentedTransaction {
+    const txn = super._buildMultiCallBundle(transactions);
+    txn.method = "tryMulticall";
+    return txn;
+  }
+
+  protected override async _executeTxnQueue(
+    chainId: number,
+    txns: AugmentedTransaction[] = [],
+    _valueTxns: AugmentedTransaction[] = [],
+    simulate = false
+  ): Promise<TransactionResponse[]> {
+    assert(_valueTxns.length === 0);
+    const nTxns = txns.length;
+    if (nTxns === 0) {
+      return [];
+    }
+
+    const networkName = getNetworkName(chainId);
+    this.logger.debug({
+      at: "TryMulticallClient#executeTxnQueue",
+      message: `${simulate ? "Simulating" : "Executing"} ${nTxns} transaction(s) on ${networkName}.`,
+    });
+
+    const buildTryMulticallTransaction = (
+      contract: Contract,
+      calldata: string[],
+      gasLimit: BigNumber
+    ): TryMulticallTransaction => ({
+      contract,
+      calldata,
+      gasLimit,
+    });
+
+    const txnRequestsToSubmit: AugmentedTransaction[] = [];
+    const txnCalldataToRebuild: TryMulticallTransaction[] = [];
+
+    // The goal is to simulate the transactions as a batch and pick out those which succeed.
+    const bundledTxns = await this.buildMultiCallBundles(txns, this.chunkSize[chainId]);
+    const bundledSimResults = await this.txnClient.simulate(bundledTxns);
+
+    bundledSimResults.forEach(({ succeed, transaction, reason, data }) => {
+      // TryMulticall _should_ always succeed, but either way, we need the return data to be defined so that we can properly
+      // filter out the transactions which failed.
+      if (!succeed || !isDefined(data?.length)) {
+        return;
+      }
+      // Address the case where we just call fillV3Relay(), and therefore the data field is empty.
+      if (succeed && transaction.method !== "tryMulticall") {
+        txnRequestsToSubmit.push(transaction);
+        return;
+      }
+      // If we make it here, then tryMulticall was simulated and there is a defined return data.
+      // Verify that the number of calls which returned data matches the number of calls made in the transaction.
+      // It is transaction.args[0], since `tryMulticall` only accepts a single argument of bytes[].
+      assert(transaction.args[0].length === data.length);
+
+      // Filter the calldata array by whether it succeeded in tryMulticall().
+      const succeededTxnCalldata = transaction.args[0].filter((_, idx) => data[idx].success);
+
+      // If |succeededTxnRequests| != # of transactions in the multicall bundle, then
+      // some txns in the bundle must have failed. We take note only of the ones which succeeded.
+      if (succeededTxnCalldata.length !== data.length) {
+        txnCalldataToRebuild.push(
+          buildTryMulticallTransaction(transaction.contract, succeededTxnCalldata, transaction.gasLimit)
+        );
+        this.logger.debug({
+          at: "tryMulticallClient#executeChainTxnQueue",
+          message: `Some calls in ${networkName} transaction batch failed!`,
+          batchTxn: { ...transaction, contract: transaction.contract.address },
+          reason,
+        });
+      } else {
+        // Otherwise, none of the transactions failed, so we can add the bundle to txnRequestsToSubmit.
+        txnRequestsToSubmit.push(transaction);
+
+        // If txn succeeded or the revert reason is known to be benign, then log at debug level.
+        this.logger.debug({
+          at: "tryMulticallClient#executeChainTxnQueue",
+          message: `Successfully simulated ${networkName} transaction batch!`,
+          batchTxn: { ...transaction, contract: transaction.contract.address },
+        });
+      }
+    });
+
+    if (txnCalldataToRebuild.length !== 0) {
+      // At this point, every transaction here will be aimed at the same spoke pool, so we only need to chunk based on
+      // chunk size. Every transaction should be aimed at the same spoke pool since 1. The tryMulticall client is only
+      // instantiated for the relayer, which uses this client only for interfacing with the spoke pool, and 2. This function
+      // is called after filtering transactions by chainId, so each individual transaction is a call to a chainId's spoke pool.
+      const rebuildTryMulticall = (txn: TryMulticallTransaction) => {
+        const mrkdwn: string[] = [];
+        const contract = txn.contract;
+        const gasLimit = txn.gasLimit;
+        txn.calldata.forEach((data, idx) => {
+          mrkdwn.push(`\n *txn. ${idx + 1}:* ${data}`);
+        });
+        return {
+          chainId,
+          contract,
+          gasLimit,
+          method: "tryMulticall",
+          args: [txn.calldata],
+          message: "Across tryMulticall transaction",
+          mrkdwn: mrkdwn.join(""),
+        };
+      };
+      const tryMulticallTxns = txnCalldataToRebuild.filter((txn) => txn.calldata.length !== 0).map(rebuildTryMulticall);
+      txnRequestsToSubmit.push(...tryMulticallTxns);
+    }
+
+    if (simulate) {
+      let mrkdwn = "";
+      txnRequestsToSubmit.forEach((txn, idx) => {
+        mrkdwn += `  *${idx + 1}. ${txn.message || "No message"}: ${txn.mrkdwn || "No markdown"}\n`;
+      });
+      this.logger.debug({
+        at: "TryMulticallClient#executeTxnQueue",
+        message: `${txnRequestsToSubmit.length}/${nTxns} ${networkName} transaction simulation(s) succeeded!`,
+        mrkdwn,
+      });
+      this.logger.debug({ at: "TryMulticallClient#executeTxnQueue", message: "Exiting simulation mode 🎮" });
+      return [];
+    }
+
+    const txnResponses =
+      txnRequestsToSubmit.length > 0 ? this.txnClient.submit(chainId, txnRequestsToSubmit) : Promise.resolve([]);
+
+    return txnResponses;
   }
 }

@@ -17,16 +17,18 @@ import {
   convertFromWei,
   createFormatFunction,
   ERC20,
-  ethers,
   fillStatusArray,
   blockExplorerLink,
   blockExplorerLinks,
-  getEthAddressForChain,
+  formatUnits,
+  getNativeTokenAddressForChain,
   getGasPrice,
   getNativeTokenSymbol,
   getNetworkName,
   getUnfilledDeposits,
   mapAsync,
+  getEndBlockBuffers,
+  parseUnits,
   providers,
   toBN,
   toBNWei,
@@ -34,17 +36,23 @@ import {
   TOKEN_SYMBOLS_MAP,
   compareAddressesSimple,
   CHAIN_IDs,
+  WETH9,
+  runTransaction,
+  isDefined,
+  resolveTokenDecimals,
+  sortEventsDescending,
+  getWidestPossibleExpectedBlockRange,
+  utils,
+  _buildPoolRebalanceRoot,
 } from "../utils";
-
 import { MonitorClients, updateMonitorClients } from "./MonitorClientHelper";
 import { MonitorConfig } from "./MonitorConfig";
-import { CombinedRefunds } from "../dataworker/DataworkerUtils";
+import { CombinedRefunds, getImpliedBundleBlockRanges } from "../dataworker/DataworkerUtils";
+import { PUBLIC_NETWORKS } from "@across-protocol/constants";
 
-export const REBALANCE_FINALIZE_GRACE_PERIOD = process.env.REBALANCE_FINALIZE_GRACE_PERIOD
-  ? Number(process.env.REBALANCE_FINALIZE_GRACE_PERIOD)
-  : 60 * 60;
 // 60 minutes, which is the length of the challenge window, so if a rebalance takes longer than this to finalize,
 // then its finalizing after the subsequent challenge period has started, which is sub-optimal.
+export const REBALANCE_FINALIZE_GRACE_PERIOD = Number(process.env.REBALANCE_FINALIZE_GRACE_PERIOD ?? 60 * 60);
 
 // bundle frequency.
 export const ALL_CHAINS_NAME = "All chains";
@@ -290,6 +298,36 @@ export class Monitor {
         mrkdwn,
       });
     }
+    Object.entries(reports).forEach(([relayer, balanceTable]) => {
+      Object.entries(balanceTable).forEach(([tokenSymbol, columns]) => {
+        const decimals = allL1Tokens.find((token) => token.symbol === tokenSymbol)?.decimals;
+        if (!decimals) {
+          throw new Error(`No decimals found for ${tokenSymbol}`);
+        }
+        Object.entries(columns).forEach(([chainName, cell]) => {
+          if (this._tokenEnabledForNetwork(tokenSymbol, chainName)) {
+            Object.entries(cell).forEach(([balanceType, balance]) => {
+              // Don't log zero balances.
+              if (balance.isZero()) {
+                return;
+              }
+              this.logger.debug({
+                at: "Monitor#reportRelayerBalances",
+                message: "Machine-readable single balance report",
+                relayer,
+                tokenSymbol,
+                decimals,
+                chainName,
+                balanceType,
+                balanceInWei: balance.toString(),
+                balance: Number(utils.formatUnits(balance, decimals)),
+                datadog: true,
+              });
+            });
+          }
+        });
+      });
+    });
   }
 
   // Update current balances of all tokens on each supported chain for each relayer.
@@ -379,8 +417,8 @@ export class Monitor {
           token,
           account,
           currentBalance: balances[i].toString(),
-          warnThreshold: ethers.utils.parseUnits(warnThreshold.toString(), decimalValues[i]),
-          errorThreshold: ethers.utils.parseUnits(errorThreshold.toString(), decimalValues[i]),
+          warnThreshold: parseUnits(warnThreshold.toString(), decimalValues[i]),
+          errorThreshold: parseUnits(errorThreshold.toString(), decimalValues[i]),
         };
       }),
     });
@@ -395,16 +433,16 @@ export class Monitor {
             const decimals = decimalValues[i];
             let trippedThreshold: { level: "warn" | "error"; threshold: number } | null = null;
 
-            if (warnThreshold !== null && balance.lt(ethers.utils.parseUnits(warnThreshold.toString(), decimals))) {
+            if (warnThreshold !== null && balance.lt(parseUnits(warnThreshold.toString(), decimals))) {
               trippedThreshold = { level: "warn", threshold: warnThreshold };
             }
-            if (errorThreshold !== null && balance.lt(ethers.utils.parseUnits(errorThreshold.toString(), decimals))) {
+            if (errorThreshold !== null && balance.lt(parseUnits(errorThreshold.toString(), decimals))) {
               trippedThreshold = { level: "error", threshold: errorThreshold };
             }
             if (trippedThreshold !== null) {
-              const ethAddressForChain = getEthAddressForChain(chainId);
+              const gasTokenAddressForChain = getNativeTokenAddressForChain(chainId);
               const symbol =
-                token === ethAddressForChain
+                token === gasTokenAddressForChain
                   ? getNativeTokenSymbol(chainId)
                   : await new Contract(
                       token,
@@ -416,7 +454,7 @@ export class Monitor {
                 text: `  ${getNetworkName(chainId)} ${symbol} balance for ${blockExplorerLink(
                   account,
                   chainId
-                )} is ${ethers.utils.formatUnits(balance, decimals)}. Threshold: ${trippedThreshold.threshold}`,
+                )} is ${formatUnits(balance, decimals)}. Threshold: ${trippedThreshold.threshold}`,
               };
             }
           }
@@ -454,7 +492,7 @@ export class Monitor {
           token,
           account,
           currentBalance: currentBalances[i].toString(),
-          target: ethers.utils.parseUnits(target.toString(), decimalValues[i]),
+          target: parseUnits(target.toString(), decimalValues[i]),
         };
       }),
     });
@@ -465,18 +503,56 @@ export class Monitor {
       refillEnabledBalances.map(async ({ chainId, isHubPool, token, account, target, trigger }, i) => {
         const currentBalance = currentBalances[i];
         const decimals = decimalValues[i];
-        const balanceTrigger = ethers.utils.parseUnits(trigger.toString(), decimals);
+        const balanceTrigger = parseUnits(trigger.toString(), decimals);
         const isBelowTrigger = currentBalance.lte(balanceTrigger);
         if (isBelowTrigger) {
           // Fill balance back to target, not trigger.
-          const balanceTarget = ethers.utils.parseUnits(target.toString(), decimals);
+          const balanceTarget = parseUnits(target.toString(), decimals);
           const deficit = balanceTarget.sub(currentBalance);
-          const canRefill = await this.balanceAllocator.requestBalanceAllocation(
+          let canRefill = await this.balanceAllocator.requestBalanceAllocation(
             chainId,
             [token],
             signerAddress,
             deficit
           );
+          // If token is gas token, try unwrapping deficit amount of WETH into ETH to have available for refill.
+          if (
+            !canRefill &&
+            token === getNativeTokenAddressForChain(chainId) &&
+            getNativeTokenSymbol(chainId) === "ETH"
+          ) {
+            const weth = new Contract(
+              TOKEN_SYMBOLS_MAP.WETH.addresses[chainId],
+              WETH9.abi,
+              this.clients.spokePoolClients[chainId].spokePool.signer
+            );
+            const wethBalance = await weth.balanceOf(signerAddress);
+            if (wethBalance.gte(deficit)) {
+              const txn = await (await runTransaction(this.logger, weth, "withdraw", [deficit])).wait();
+              this.logger.info({
+                at: "Monitor#refillBalances",
+                message: `Unwrapped WETH from ${signerAddress} to refill ETH in ${account} 🎁!`,
+                chainId,
+                requiredUnwrapAmount: deficit.toString(),
+                wethBalance,
+                wethAddress: weth.address,
+                ethBalance: currentBalance.toString(),
+                transactionHash: blockExplorerLink(txn.transactionHash, chainId),
+              });
+              canRefill = true;
+            } else {
+              this.logger.warn({
+                at: "Monitor#refillBalances",
+                message: `Trying to unwrap WETH balance from ${signerAddress} to use for refilling ETH in ${account} but not enough WETH to unwrap`,
+                chainId,
+                requiredUnwrapAmount: deficit.toString(),
+                wethBalance,
+                wethAddress: weth.address,
+                ethBalance: currentBalance.toString(),
+              });
+              return;
+            }
+          }
           if (canRefill) {
             this.logger.debug({
               at: "Monitor#refillBalances",
@@ -501,7 +577,7 @@ export class Monitor {
                 method: "loadEthForL2Calls",
                 args: [],
                 message: "Reloaded ETH in HubPool 🫡!",
-                mrkdwn: `Loaded ${ethers.utils.formatUnits(deficit, decimals)} ETH from ${signerAddress}.`,
+                mrkdwn: `Loaded ${formatUnits(deficit, decimals)} ETH from ${signerAddress}.`,
                 value: deficit,
               });
             } else {
@@ -514,7 +590,7 @@ export class Monitor {
               const receipt = await tx.wait();
               this.logger.info({
                 at: "Monitor#refillBalances",
-                message: `Reloaded ${ethers.utils.formatUnits(
+                message: `Reloaded ${formatUnits(
                   deficit,
                   decimals
                 )} ${nativeSymbolForChain} for ${account} from ${signerAddress} 🫡!`,
@@ -557,6 +633,268 @@ export class Monitor {
     }
   }
 
+  async checkSpokePoolRunningBalances(): Promise<void> {
+    // We define a custom format function since we do not want the same precision that `convertFromWei` gives us.
+    const formatWei = (weiVal: string, decimals: number) =>
+      weiVal === "0" ? "0" : createFormatFunction(1, 4, false, decimals)(weiVal);
+
+    const hubPoolClient = this.clients.hubPoolClient;
+    const monitoredTokenSymbols = this.monitorConfig.monitoredTokenSymbols;
+
+    // Define the chain IDs in the same order as `enabledChainIds` so that block range ordering is preserved.
+    const chainIds =
+      this.monitorConfig.monitoredSpokePoolChains.length !== 0
+        ? this.monitorChains.filter((chain) => this.monitorConfig.monitoredSpokePoolChains.includes(chain))
+        : this.monitorChains;
+
+    const l2TokenForChain = (chainId: number, symbol: string) => {
+      return TOKEN_SYMBOLS_MAP[symbol]?.addresses[chainId];
+    };
+    const pendingRelayerRefunds = {};
+    const pendingRebalanceRoots = {};
+
+    // Take the validated bundles from the hub pool client.
+    const validatedBundles = sortEventsDescending(hubPoolClient.getValidatedRootBundles()).slice(
+      0,
+      this.monitorConfig.bundlesCount
+    );
+
+    // Fetch the data from the latest root bundle.
+    const bundle = hubPoolClient.getLatestProposedRootBundle();
+    // If there is an outstanding root bundle, then add it to the bundles to check. Otherwise, ignore it.
+    const bundlesToCheck = validatedBundles
+      .map((validatedBundle) => validatedBundle.transactionHash)
+      .includes(bundle.transactionHash)
+      ? validatedBundles
+      : [...validatedBundles, bundle];
+
+    const nextBundleMainnetStartBlock = hubPoolClient.getNextBundleStartBlockNumber(
+      this.clients.bundleDataClient.chainIdListForBundleEvaluationBlockNumbers,
+      hubPoolClient.latestBlockSearched,
+      hubPoolClient.chainId
+    );
+    const enabledChainIds = this.clients.configStoreClient.getChainIdIndicesForBlock(nextBundleMainnetStartBlock);
+
+    this.logger.debug({
+      at: "Monitor#checkSpokePoolRunningBalances",
+      message: "Mainnet root bundles in scope",
+      validatedBundles,
+      outstandingBundle: bundle,
+    });
+
+    const slowFillBlockRange = getWidestPossibleExpectedBlockRange(
+      enabledChainIds,
+      this.clients.spokePoolClients,
+      getEndBlockBuffers(enabledChainIds, this.clients.bundleDataClient.blockRangeEndBlockBuffer),
+      this.clients,
+      hubPoolClient.latestBlockSearched,
+      this.clients.configStoreClient.getEnabledChains(hubPoolClient.latestBlockSearched)
+    );
+    const blockRangeTail = bundle.bundleEvaluationBlockNumbers.map((endBlockForChain, idx) => {
+      const endBlockNumber = Number(endBlockForChain);
+      const spokeLatestBlockSearched = this.clients.spokePoolClients[enabledChainIds[idx]]?.latestBlockSearched ?? 0;
+      return spokeLatestBlockSearched === 0
+        ? [endBlockNumber, endBlockNumber]
+        : [endBlockNumber + 1, spokeLatestBlockSearched > endBlockNumber ? spokeLatestBlockSearched : endBlockNumber];
+    });
+
+    this.logger.debug({
+      at: "Monitor#checkSpokePoolRunningBalances",
+      message: "Block ranges to search",
+      slowFillBlockRange,
+      blockRangeTail,
+    });
+
+    const lastProposedBundleBlockRanges = getImpliedBundleBlockRanges(
+      hubPoolClient,
+      this.clients.configStoreClient,
+      hubPoolClient.hasPendingProposal()
+        ? hubPoolClient.getLatestProposedRootBundle()
+        : hubPoolClient.getNthFullyExecutedRootBundle(-1)
+    );
+    // Do all async tasks in parallel. We want to know about the pool rebalances, slow fills in the most recent proposed bundle, refunds
+    // from the last `n` bundles, pending refunds which have not been made official via a root bundle proposal, and the current balances of
+    // all the spoke pools.
+    const [
+      poolRebalanceRoot,
+      currentBundleData,
+      accountedBundleRefunds,
+      unaccountedBundleRefunds,
+      currentSpokeBalances,
+    ] = await Promise.all([
+      this.clients.bundleDataClient.loadData(lastProposedBundleBlockRanges, this.clients.spokePoolClients, true),
+      this.clients.bundleDataClient.loadData(slowFillBlockRange, this.clients.spokePoolClients, true),
+      mapAsync(bundlesToCheck, async (proposedBundle) =>
+        this.clients.bundleDataClient.getPendingRefundsFromBundle(proposedBundle)
+      ),
+      this.clients.bundleDataClient.getApproximateRefundsForBlockRange(enabledChainIds, blockRangeTail),
+      Object.fromEntries(
+        await mapAsync(chainIds, async (chainId) => {
+          const spokePool = this.clients.spokePoolClients[chainId].spokePool.address;
+          const l2TokenAddresses = monitoredTokenSymbols
+            .map((symbol) => l2TokenForChain(chainId, symbol))
+            .filter(isDefined);
+          const balances = Object.fromEntries(
+            await mapAsync(l2TokenAddresses, async (l2Token) => [
+              l2Token,
+              (
+                await this._getBalances([
+                  {
+                    token: l2Token,
+                    chainId: chainId,
+                    account: spokePool,
+                  },
+                ])
+              )[0],
+            ])
+          );
+          return [chainId, balances];
+        })
+      ),
+    ]);
+
+    const poolRebalanceLeaves = _buildPoolRebalanceRoot(
+      lastProposedBundleBlockRanges[0][1],
+      lastProposedBundleBlockRanges[0][1],
+      poolRebalanceRoot.bundleDepositsV3,
+      poolRebalanceRoot.bundleFillsV3,
+      poolRebalanceRoot.bundleSlowFillsV3,
+      poolRebalanceRoot.unexecutableSlowFills,
+      poolRebalanceRoot.expiredDepositsToRefundV3,
+      this.clients
+    ).leaves;
+
+    // Get the pool rebalance leaf amounts.
+    const enabledTokens = [...hubPoolClient.getL1Tokens()];
+    for (const leaf of poolRebalanceLeaves) {
+      if (!chainIds.includes(leaf.chainId)) {
+        continue;
+      }
+      const l2TokenMap = this.getL2ToL1TokenMap(enabledTokens, leaf.chainId);
+      pendingRebalanceRoots[leaf.chainId] = {};
+      Object.entries(l2TokenMap).forEach(([l2Token, l1Token]) => {
+        const rebalanceAmount = leaf.netSendAmounts[leaf.l1Tokens.findIndex((token) => token === l1Token.address)];
+        pendingRebalanceRoots[leaf.chainId][l2Token] = rebalanceAmount ?? bnZero;
+      });
+    }
+
+    this.logger.debug({
+      at: "Monitor#checkSpokePoolRunningBalances",
+      message: "Print pool rebalance leaves",
+      poolRebalanceRootLeaves: poolRebalanceLeaves,
+    });
+
+    // Calculate the pending refunds.
+    for (const chainId of chainIds) {
+      const l2TokenAddresses = monitoredTokenSymbols
+        .map((symbol) => l2TokenForChain(chainId, symbol))
+        .filter(isDefined);
+      pendingRelayerRefunds[chainId] = {};
+      l2TokenAddresses.forEach((l2Token) => {
+        const pendingValidatedDeductions = accountedBundleRefunds
+          .map((refund) => refund[chainId]?.[l2Token])
+          .filter(isDefined)
+          .reduce(
+            (totalPendingRefunds, refunds) =>
+              Object.values(refunds).reduce(
+                (totalBundleRefunds, bundleRefund) => totalBundleRefunds.add(bundleRefund),
+                bnZero
+              ),
+            bnZero
+          );
+        const nextBundleDeductions = [unaccountedBundleRefunds]
+          .map((refund) => refund[chainId]?.[l2Token])
+          .filter(isDefined)
+          .reduce(
+            (totalPendingRefunds, refunds) =>
+              Object.values(refunds).reduce(
+                (totalBundleRefunds, bundleRefund) => totalBundleRefunds.add(bundleRefund),
+                bnZero
+              ),
+            bnZero
+          );
+        pendingRelayerRefunds[chainId][l2Token] = pendingValidatedDeductions.add(nextBundleDeductions);
+      });
+
+      this.logger.debug({
+        at: "Monitor#checkSpokePoolRunningBalances",
+        message: "Print refund amounts for chainId",
+        chainId,
+        pendingDeductions: pendingRelayerRefunds[chainId],
+      });
+    }
+
+    // Get the slow fill amounts. Only do this step if there were slow fills in the most recent root bundle.
+    Object.entries(currentBundleData.bundleSlowFillsV3)
+      .filter(([chainId]) => chainIds.includes(+chainId))
+      .map(([chainId, bundleSlowFills]) => {
+        const l2TokenAddresses = monitoredTokenSymbols
+          .map((symbol) => l2TokenForChain(+chainId, symbol))
+          .filter(isDefined);
+        Object.entries(bundleSlowFills)
+          .filter(([l2Token]) => l2TokenAddresses.includes(l2Token))
+          .map(([l2Token, fills]) => {
+            const pendingSlowFillAmounts = fills
+              .map((fill) => fill.outputAmount)
+              .filter(isDefined)
+              .reduce((totalAmounts, outputAmount) => totalAmounts.add(outputAmount), bnZero);
+            pendingRelayerRefunds[chainId][l2Token] =
+              pendingRelayerRefunds[chainId][l2Token].add(pendingSlowFillAmounts);
+          });
+      });
+
+    // Print the output: The current spoke pool balance, the amount of refunds to payout, the pending pool rebalances, and then the sum of the three.
+    let tokenMarkdown =
+      "Token amounts: current, pending relayer refunds, pool rebalances, adjusted spoke pool balance\n";
+    for (const tokenSymbol of monitoredTokenSymbols) {
+      tokenMarkdown += `*[${tokenSymbol}]*\n`;
+      for (const chainId of chainIds) {
+        const tokenAddress = l2TokenForChain(chainId, tokenSymbol);
+
+        // If the token does not exist on the chain, then ignore this report.
+        if (!isDefined(tokenAddress)) {
+          continue;
+        }
+
+        const tokenDecimals = resolveTokenDecimals(tokenSymbol);
+        const currentSpokeBalance = formatWei(currentSpokeBalances[chainId][tokenAddress].toString(), tokenDecimals);
+
+        // Relayer refunds may be undefined when there were no refunds included in the last bundle.
+        const currentRelayerRefunds = formatWei(
+          (pendingRelayerRefunds[chainId]?.[tokenAddress] ?? bnZero).toString(),
+          tokenDecimals
+        );
+        // Rebalance roots will be undefined when there was no root in the last bundle for the chain.
+        const currentRebalanceRoots = formatWei(
+          (pendingRebalanceRoots[chainId]?.[tokenAddress] ?? bnZero).toString(),
+          tokenDecimals
+        );
+        const virtualSpokeBalance = formatWei(
+          currentSpokeBalances[chainId][tokenAddress]
+            .add(pendingRebalanceRoots[chainId]?.[tokenAddress] ?? bnZero)
+            .sub(pendingRelayerRefunds[chainId]?.[tokenAddress] ?? bnZero)
+            .toString(),
+          tokenDecimals
+        );
+        tokenMarkdown += `${getNetworkName(chainId)}: `;
+        tokenMarkdown +=
+          currentSpokeBalance +
+          `, ${currentRelayerRefunds !== "0" ? "-" : ""}` +
+          currentRelayerRefunds +
+          ", " +
+          currentRebalanceRoots +
+          ", " +
+          virtualSpokeBalance +
+          "\n";
+      }
+    }
+    this.logger.info({
+      at: "Monitor#checkSpokePoolRunningBalances",
+      message: "Spoke pool balance report",
+      mrkdwn: tokenMarkdown,
+    });
+  }
+
   // We approximate stuck rebalances by checking if there are still any pending cross chain transfers to any SpokePools
   // some fixed amount of time (grace period) after the last bundle execution. This can give false negative if there are
   // transfers stuck for longer than 1 bundle and the current time is within the last bundle execution + grace period.
@@ -564,8 +902,8 @@ export class Monitor {
   // should stay unstuck for longer than one bundle.
   async checkStuckRebalances(): Promise<void> {
     const hubPoolClient = this.clients.hubPoolClient;
-    const { currentTime } = hubPoolClient;
-    const lastFullyExecutedBundle = hubPoolClient.getLatestFullyExecutedRootBundle(hubPoolClient.latestBlockSearched);
+    const { currentTime, latestBlockSearched } = hubPoolClient;
+    const lastFullyExecutedBundle = hubPoolClient.getLatestFullyExecutedRootBundle(latestBlockSearched);
     // This case shouldn't happen outside of tests as Across V2 has already launched.
     if (lastFullyExecutedBundle === undefined) {
       return;
@@ -573,7 +911,20 @@ export class Monitor {
     const lastFullyExecutedBundleTime = lastFullyExecutedBundle.challengePeriodEndTimestamp;
 
     const allL1Tokens = this.clients.hubPoolClient.getL1Tokens();
+    const poolRebalanceLeaves = this.clients.hubPoolClient.getExecutedLeavesForRootBundle(
+      lastFullyExecutedBundle,
+      latestBlockSearched
+    );
     for (const chainId of this.crossChainAdapterSupportedChains) {
+      // Exit early if there were no pool rebalance leaves for this chain executed in the last bundle.
+      const poolRebalanceLeaf = poolRebalanceLeaves.find((leaf) => leaf.chainId === chainId);
+      if (!poolRebalanceLeaf) {
+        this.logger.debug({
+          at: "Monitor#checkStuckRebalances",
+          message: `No pool rebalance leaves for ${getNetworkName(chainId)} in last bundle`,
+        });
+        continue;
+      }
       const gracePeriod = EXPECTED_L1_TO_L2_MESSAGE_TIME[chainId] ?? REBALANCE_FINALIZE_GRACE_PERIOD;
       // If we're still within the grace period, skip looking for any stuck rebalances.
       // Again, this would give false negatives for transfers that have been stuck for longer than one bundle if the
@@ -585,7 +936,7 @@ export class Monitor {
           lastFullyExecutedBundleTime,
           currentTime,
         });
-        return;
+        continue;
       }
 
       // If chain wasn't active in latest bundle, then skip it.
@@ -909,9 +1260,9 @@ export class Monitor {
         if (this.balanceCache[chainId]?.[token]?.[account]) {
           return this.balanceCache[chainId][token][account];
         }
-        const ethAddressForChain = getEthAddressForChain(chainId);
+        const gasTokenAddressForChain = getNativeTokenAddressForChain(chainId);
         const balance =
-          token === ethAddressForChain
+          token === gasTokenAddressForChain
             ? await this.clients.spokePoolClients[chainId].spokePool.provider.getBalance(account)
             : // Use the latest block number the SpokePoolClient is aware of to query balances.
               // This prevents double counting when there are very recent refund leaf executions that the SpokePoolClients
@@ -936,8 +1287,8 @@ export class Monitor {
   private async _getDecimals(decimalrequests: { chainId: number; token: string }[]): Promise<number[]> {
     return await Promise.all(
       decimalrequests.map(async ({ chainId, token }) => {
-        const ethAddressForChain = getEthAddressForChain(chainId);
-        if (token === ethAddressForChain) {
+        const gasTokenAddressForChain = getNativeTokenAddressForChain(chainId);
+        if (token === gasTokenAddressForChain) {
           return 18;
         } // Assume all EVM chains have 18 decimal native tokens.
         if (this.decimals[chainId]?.[token]) {
@@ -957,5 +1308,14 @@ export class Monitor {
         return decimals;
       })
     );
+  }
+
+  private _tokenEnabledForNetwork(tokenSymbol: string, networkName: string): boolean {
+    for (const [chainId, network] of Object.entries(PUBLIC_NETWORKS)) {
+      if (network.name === networkName) {
+        return isDefined(TOKEN_SYMBOLS_MAP[tokenSymbol]?.addresses[chainId]);
+      }
+    }
+    return false;
   }
 }

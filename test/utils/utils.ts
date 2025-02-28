@@ -3,14 +3,24 @@ import { TokenRolesEnum } from "@uma/common";
 import { SpyTransport, bigNumberFormatter } from "@uma/logger";
 import { AcrossConfigStore, FakeContract } from "@across-protocol/contracts";
 import { constants, utils as sdkUtils } from "@across-protocol/sdk";
-import { BigNumber, Contract, providers } from "ethers";
+import { Contract, providers } from "ethers";
 import chai, { assert, expect } from "chai";
 import chaiExclude from "chai-exclude";
 import sinon from "sinon";
 import winston from "winston";
 import { GLOBAL_CONFIG_STORE_KEYS } from "../../src/clients";
-import { V3Deposit, V3DepositWithBlock, V3FillWithBlock, V3SlowFillLeaf } from "../../src/interfaces";
-import { isDefined, spreadEvent, toBN, toBNWei, toWei, utf8ToHex, ZERO_ADDRESS } from "../../src/utils";
+import { Deposit, DepositWithBlock, FillWithBlock, SlowFillLeaf } from "../../src/interfaces";
+import {
+  BigNumber,
+  isDefined,
+  spreadEvent,
+  toBN,
+  toBNWei,
+  toWei,
+  utf8ToHex,
+  ZERO_ADDRESS,
+  getMessageHash,
+} from "../../src/utils";
 import {
   DEFAULT_BLOCK_RANGE_FOR_CHAIN,
   MAX_L1_TOKENS_PER_POOL_REBALANCE_LEAF,
@@ -18,6 +28,7 @@ import {
   sampleRateModel,
 } from "../constants";
 import { SpokePoolDeploymentResult, SpyLoggerResult } from "../types";
+import { INFINITE_FILL_DEADLINE } from "../../src/common";
 
 export {
   SpyTransport,
@@ -42,7 +53,6 @@ export const {
   modifyRelayHelper,
   randomAddress,
 } = utils;
-export const { getRelayDataHash } = sdkUtils;
 
 export type SignerWithAddress = utils.SignerWithAddress;
 export { assert, chai, expect, BigNumber, Contract, FakeContract, sinon, toBN, toBNWei, toWei, utf8ToHex, winston };
@@ -275,7 +285,7 @@ export async function depositV3(
     exclusivityDeadline?: number;
     exclusiveRelayer?: string;
   } = {}
-): Promise<V3DepositWithBlock> {
+): Promise<DepositWithBlock> {
   const depositor = signer.address;
   const recipient = opts.recipient ?? depositor;
 
@@ -286,53 +296,74 @@ export async function depositV3(
   const quoteTimestamp = opts.quoteTimestamp ?? spokePoolTime;
   const message = opts.message ?? constants.EMPTY_MESSAGE;
   const fillDeadline = opts.fillDeadline ?? spokePoolTime + fillDeadlineBuffer;
+  const isLegacyDeposit = INFINITE_FILL_DEADLINE.eq(fillDeadline);
   const exclusivityDeadline = opts.exclusivityDeadline ?? 0;
   const exclusiveRelayer = opts.exclusiveRelayer ?? ZERO_ADDRESS;
 
   const [originChainId, txnResponse] = await Promise.all([
     spokePool.chainId(),
-    spokePool
-      .connect(signer)
-      .depositV3(
-        depositor,
-        recipient,
-        inputToken,
-        outputToken,
-        inputAmount,
-        outputAmount,
-        destinationChainId,
-        exclusiveRelayer,
-        quoteTimestamp,
-        fillDeadline,
-        exclusivityDeadline,
-        message
-      ),
+    isLegacyDeposit
+      ? spokePool
+          .connect(signer)
+          .depositFor(
+            depositor,
+            recipient,
+            inputToken,
+            inputAmount,
+            destinationChainId,
+            inputAmount.sub(outputAmount).mul(toWei(1)).div(inputAmount),
+            quoteTimestamp,
+            message,
+            0
+          )
+      : spokePool
+          .connect(signer)
+          .depositV3(
+            depositor,
+            recipient,
+            inputToken,
+            outputToken,
+            inputAmount,
+            outputAmount,
+            destinationChainId,
+            exclusiveRelayer,
+            quoteTimestamp,
+            fillDeadline,
+            exclusivityDeadline,
+            message
+          ),
   ]);
   const txnReceipt = await txnResponse.wait();
 
-  const _topic = "V3FundsDeposited";
+  const _topic = "FundsDeposited";
   const topic = spokePool.interface.getEventTopic(_topic);
   const eventLog = txnReceipt.logs.find(({ topics: [eventTopic] }) => eventTopic === topic);
   const { args } = spokePool.interface.parseLog(eventLog);
   const { blockNumber, transactionHash, transactionIndex } = txnReceipt;
   const { logIndex } = eventLog;
 
-  return {
+  const depositObject = {
     originChainId: Number(originChainId),
     blockNumber,
     transactionHash,
     transactionIndex,
     logIndex,
     ...spreadEvent(args),
+    messageHash: args.messageHash ?? getMessageHash(args.message),
   };
+  if (isLegacyDeposit) {
+    depositObject.outputToken = outputToken;
+  }
+  return depositObject;
 }
 
 export async function updateDeposit(
   spokePool: Contract,
-  deposit: V3Deposit,
+  deposit: Deposit,
   depositor: SignerWithAddress
 ): Promise<string> {
-  const { updatedRecipient, updatedOutputAmount, updatedMessage } = deposit;
+  const { updatedRecipient: updatedRecipientAddress, updatedOutputAmount, updatedMessage } = deposit;
+  const updatedRecipient = sdkUtils.toBytes32(updatedRecipientAddress!);
   assert.ok(isDefined(updatedRecipient));
   assert.ok(isDefined(updatedOutputAmount));
   assert.ok(isDefined(updatedMessage));
@@ -341,14 +372,14 @@ export async function updateDeposit(
     deposit.depositId,
     deposit.originChainId,
     updatedOutputAmount!,
-    updatedRecipient!,
+    updatedRecipient,
     updatedMessage!
   );
 
   await spokePool
     .connect(depositor)
-    .speedUpV3Deposit(
-      depositor.address,
+    .speedUpDeposit(
+      sdkUtils.toBytes32(depositor.address),
       deposit.depositId,
       updatedOutputAmount,
       updatedRecipient,
@@ -360,16 +391,16 @@ export async function updateDeposit(
 
 export async function fillV3Relay(
   spokePool: Contract,
-  deposit: Omit<V3Deposit, "destinationChainId">,
+  deposit: Omit<Deposit, "destinationChainId">,
   signer: SignerWithAddress,
   repaymentChainId?: number
-): Promise<V3FillWithBlock> {
+): Promise<FillWithBlock> {
   const destinationChainId = Number(await spokePool.chainId());
   assert.notEqual(deposit.originChainId, destinationChainId);
 
   await spokePool.connect(signer).fillV3Relay(deposit, repaymentChainId ?? destinationChainId);
 
-  const events = await spokePool.queryFilter(spokePool.filters.FilledV3Relay());
+  const events = await spokePool.queryFilter(spokePool.filters.FilledRelay());
   const lastEvent = events.at(-1);
   let args = lastEvent!.args;
   assert.exists(args);
@@ -377,32 +408,19 @@ export async function fillV3Relay(
 
   const { blockNumber, transactionHash, transactionIndex, logIndex } = lastEvent!;
 
+  const parsedEvent = spreadEvent(args);
   return {
-    depositId: args.depositId,
-    originChainId: Number(args.originChainId),
     destinationChainId,
-    depositor: args.depositor,
-    recipient: args.recipient,
-    inputToken: args.inputToken,
-    inputAmount: args.inputAmount,
-    outputToken: args.outputToken,
-    outputAmount: args.outputAmount,
-    message: args.message,
-    fillDeadline: args.fillDeadline,
-    exclusivityDeadline: args.exclusivityDeadline,
-    exclusiveRelayer: args.exclusiveRelayer,
-    relayer: args.relayer,
-    repaymentChainId: Number(args.repaymentChainId),
-    relayExecutionInfo: {
-      updatedRecipient: args.relayExecutionInfo.updatedRecipient,
-      updatedMessage: args.relayExecutionInfo.updatedMessage,
-      updatedOutputAmount: args.relayExecutionInfo.updatedOutputAmount,
-      fillType: args.relayExecutionInfo.fillType,
-    },
     blockNumber,
     transactionHash,
     transactionIndex,
     logIndex,
+    ...parsedEvent,
+    messageHash: args.messageHash ?? getMessageHash(args.message),
+    relayExecutionInfo: {
+      ...parsedEvent.relayExecutionInfo,
+      updatedMessageHash: getMessageHash(parsedEvent.relayExecutionInfo.updatedMessage),
+    },
   };
 }
 
@@ -419,19 +437,19 @@ export async function addLiquidity(
   await hubPool.connect(signer).addLiquidity(l1Token.address, amount);
 }
 
-export function buildV3SlowRelayLeaves(deposits: interfaces.V3Deposit[], lpFeePct: BigNumber): V3SlowFillLeaf[] {
+export function buildV3SlowRelayLeaves(deposits: interfaces.Deposit[], lpFeePct: BigNumber): SlowFillLeaf[] {
   const chainId = deposits[0].destinationChainId;
   assert.isTrue(deposits.every(({ destinationChainId }) => chainId === destinationChainId));
   return deposits
     .map((deposit) => {
       const lpFee = deposit.inputAmount.mul(lpFeePct).div(toBNWei(1));
-      const slowFillLeaf: V3SlowFillLeaf = {
+      const slowFillLeaf: SlowFillLeaf = {
         relayData: {
-          depositor: deposit.depositor,
-          recipient: deposit.recipient,
-          exclusiveRelayer: deposit.exclusiveRelayer,
-          inputToken: deposit.inputToken,
-          outputToken: deposit.outputToken,
+          depositor: sdkUtils.toBytes32(deposit.depositor),
+          recipient: sdkUtils.toBytes32(deposit.recipient),
+          exclusiveRelayer: sdkUtils.toBytes32(deposit.exclusiveRelayer),
+          inputToken: sdkUtils.toBytes32(deposit.inputToken),
+          outputToken: sdkUtils.toBytes32(deposit.outputToken),
           inputAmount: deposit.inputAmount,
           outputAmount: deposit.outputAmount,
           originChainId: deposit.originChainId,
@@ -459,6 +477,10 @@ export function buildV3SlowRelayLeaves(deposits: interfaces.V3Deposit[], lpFeePc
 // cache key.
 export function getDefaultBlockRange(toBlockOffset: number): number[][] {
   return DEFAULT_BLOCK_RANGE_FOR_CHAIN.map((range) => [range[0], range[1] + toBlockOffset]);
+}
+
+export function getDisabledBlockRanges(): number[][] {
+  return DEFAULT_BLOCK_RANGE_FOR_CHAIN.map((range) => [range[0], range[0]]);
 }
 
 export function createRefunds(

@@ -30,7 +30,7 @@ export async function constructDataworkerClients(
   const commonClients = await constructClients(logger, config, baseSigner);
   const { hubPoolClient, configStoreClient } = commonClients;
 
-  await updateClients(commonClients, config);
+  await updateClients(commonClients, config, logger);
   await hubPoolClient.update();
 
   // We don't pass any spoke pool clients to token client since data worker doesn't need to set approvals for L2 tokens.
@@ -101,8 +101,11 @@ export async function constructSpokePoolClientsForFastDataworker(
     "RelayedRootBundle",
     "ExecutedRelayerRefundRoot",
     "V3FundsDeposited",
+    "FundsDeposited",
     "RequestedV3SlowFill",
+    "RequestedSlowFill",
     "FilledV3Relay",
+    "FilledRelay",
   ]);
   Object.values(spokePoolClients).forEach(({ chainId, isUpdated }) =>
     assert(isUpdated, `Failed to update SpokePoolClient for chain ${chainId}`)
@@ -111,7 +114,7 @@ export async function constructSpokePoolClientsForFastDataworker(
 }
 
 export function getSpokePoolClientEventSearchConfigsForFastDataworker(
-  config: Omit<DataworkerConfig, "loadAndValidateConfigForChains">,
+  config: Omit<DataworkerConfig, "validate">,
   clients: DataworkerClients,
   dataworker: Dataworker
 ): {
@@ -157,7 +160,7 @@ export function getSpokePoolClientEventSearchConfigsForFastDataworker(
       : Object.fromEntries(
           dataworker.chainIdListForBundleEvaluationBlockNumbers.map((chainId, i) => {
             // If block for chainId doesn't exist in bundleEvaluationBlockNumbers, then leave undefined which
-            // will reuslt in querying from the spoke activation block.
+            // will result in querying from the spoke activation block.
             if (i >= fromBundle.bundleEvaluationBlockNumbers.length) {
               return [chainId, undefined];
             }

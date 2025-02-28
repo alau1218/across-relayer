@@ -1,12 +1,14 @@
 # How Across Root Bundles are Constructed
 
-This document explains how the Dataworker constructs "root bundles", which instruct the Across system how to reallocate LP capital to keep the system functioning and providing an effective bridging service.
+This document explains how the Dataworker constructs "root bundles", which instruct the Across system on how to reallocate LP capital to keep the system functioning and providing an effective bridging service.
+
+The following README is a simplified summary of the exact protocol rules described in [UMIP-179](https://github.com/UMAprotocol/UMIPs/blob/2046d3cc228cacfb27688fc02e9674aef13445c9/UMIPs/umip-179.md) and its predecessor [UMIP-157](https://github.com/UMAprotocol/UMIPs/blob/92abcfcb676b0c24690811751521cd0782af5372/UMIPs/umip-157). These UMIP's describe the explicit rules that the Dataworker implements. In other words, the "Dataworker" code is an implementation of the UMIP-179 "interface".
 
 ## Why does Across need to move capital around?
 
 There are two types of capital pools in Across: liquidity provider capital in the `HubPool` ("LP capital") and capital held in the `SpokePools` ("SpokePool balance").
 
-SpokePool capital is required for two purposes: refunding relayers who successfully filled a deposit, on the repayment chain of their choice, and fulfilling deposits "slowly". These "slow" fills are performed when a deposit has not been fully filled by relayers and provides an assurance to depositors that their deposits will be filled **eventually** after some capped amount of time.
+SpokePool capital is required for two purposes: refunding relayers who successfully filled a deposit, on the repayment chain of their choice, and fulfilling deposits "slowly". These "slow" fills are performed when a deposit has not been fully filled by relayers and provide an assurance to depositors that their deposits will be filled **eventually** after some capped amount of time.
 
 However, oftentimes SpokePools do not have enough capital on hand to fulfill the capital requirements described in the previous paragraph. This is when Across would want to tap into LP capital on HubPool to fulfill these capital deficits. Usually, the L2 network on which the SpokePool in question is deployed has a canonical bridge connected to Ethereum, where the HubPool is deployed. Across can therefore send its LP capital from the HubPool to the SpokePool and usually, this is a pretty fast L1 to L2 bridge over the canonical bridge.
 
@@ -33,13 +35,13 @@ Relayer --> [*]
 
 ### What is a canonical bridge?
 
-An L2's "canonical bridge" is one that is secured by the same trusted agents that secures the consensus of the network. For example, Optimism, Arbitrum and Polygon have canonical burn-and-mint bridges, while Avalanche bridge is secured by a [wardens-based system](https://li.fi/knowledge-hub/avalanche-bridge-a-deep-dive/) that is separate from the [Avalanche validators](https://docs.avax.network/learn/avalanche/avalanche-consensus). Ultimately, it is required to read the code of an L2's bridge to determine whether it introduces additional trust assumoptions.
+An L2's "canonical bridge" is one that is secured by the same trusted agents that secure the consensus of the network. For example, Optimism, Arbitrum and Polygon have canonical burn-and-mint bridges, while Avalanche bridge is secured by a [wardens-based system](https://li.fi/knowledge-hub/avalanche-bridge-a-deep-dive/) that is separate from the [Avalanche validators](https://docs.avax.network/learn/avalanche/avalanche-consensus). Ultimately, it is required to read the code of an L2's bridge to determine whether it introduces additional trust assumptions.
 
 ### Supporting capital deficits on SpokePools without canonical bridges
 
-When an L2's SpokePool doesn't have a canonical bridge connected to Ethereum, Across has a few ways to over come this.
+When an L2's SpokePool doesn't have a canonical bridge connected to Ethereum, Across has a few ways to overcome this.
 
-One, it could use a third party bridge, but this is strongly avoided because it exposes LP capital to additional trust assumptions. Across historically has avoided supporting networks without canonical bridges for this reason, and moreover its been unnecessary as the most popular L2 networks have proven to be those that have spent the time to build out an effective canonical bridge.
+One, it could use a third party bridge, but this is strongly avoided because it exposes LP capital to additional trust assumptions. Across historically has avoided supporting networks without canonical bridges for this reason, and moreover it's been unnecessary as the most popular L2 networks have proven to be those that have spent the time to build out an effective canonical bridge.
 
 Secondly, it could try to incentivize depositors to send capital to the SpokePool that Across can use to refund relayers and execute slow fills. Depositors obviously are incentivized by profit so they must have a reason to deposit on a SpokePool.
 
@@ -68,9 +70,9 @@ If the running balance is positive, then Across has a choice: keep the excess ba
 
 ## How often does Across move capital around?
 
-In a fantastical world, Across moves capital around instantaneously whenever capital deficits and excesses appear. This is obviously unrealistic however because bundles are constructed and proposed optimistically. This means that an actor, called a "Dataworker", will propose instructions for moving LP capital around that are subject to an optimistic challenge period. This challenge period is currently set to two hours. This valueis configured such that all actors with stake in Across, including relayers who need to be refunded, LP's who have deposited funds passively to earn yield in the HubPool, and depositors who are expecting to be filled on their destination chain, can verify that the instructions proposed are valid.
+In a fantastical world, Across moves capital around instantaneously whenever capital deficits and excesses appear. This is obviously unrealistic however because bundles are constructed and proposed optimistically. This means that an actor, called a "Dataworker", will propose instructions for moving LP capital around that are subject to an optimistic challenge period. This challenge period is currently set to two hours. This value is configured such that all actors with stake in Across, including relayers who need to be refunded, LP's who have deposited funds passively to earn yield in the HubPool, and depositors who are expecting to be filled on their destination chain, can verify that the instructions proposed are valid.
 
-These instructions can very easily be modified to conduct an "attack" on Across: "send all LP capital to my EOA on the Ethereum_SpokePool". Therefore its important that these bundle proposals are subject to a long enough challenge period that every invalid bundle gets challenged.
+These instructions can very easily be modified to conduct an "attack" on Across: "send all LP capital to my EOA on the Ethereum_SpokePool". Therefore it's important that these bundle proposals are subject to a long enough challenge period that every invalid bundle gets challenged.
 
 On the other hand, the longer the challenge period, the slower that Across can respond to capital requirements. Across essentially can only move capital around as often as the challenge period, so every two hours currently.
 
@@ -97,7 +99,7 @@ One assumption in Across, is that each chain that Across supports must have an e
 
 ## Determining bundle start blocks when evaluating a pending root bundle proposal
 
-`B` is trivially known since it is emitted in the [`ProposedRootBundle`](https://github.com/across-protocol/contracts/blob/master/contracts/HubPool.sol#L152) event during the creation of each new pending bundle proposal. We therefore need to find `A`, the bundle start block `<= B` to evaluating the root bundle.
+`B` is trivially known since it is emitted in the [`ProposedRootBundle`](https://github.com/across-protocol/contracts/blob/master/contracts/HubPool.sol#L152) event during the creation of each new pending bundle proposal. We therefore need to find `A`, the bundle start block `<= B` to evaluate the root bundle.
 
 ```mermaid
 flowchart LR
@@ -123,48 +125,51 @@ flowchart TD
 
 ### Validating fills
 
-A fill must match a deposit on every shared parameter that they have in common. The matched deposit does not have to be in the same bundle as the fill. A fill contains the following [event parameter](https://github.com/across-protocol/contracts/blob/master/contracts/SpokePool.sol#L139)'s:
+A fill must match a deposit on every shared parameter that they have in common. The matched deposit does not have to be in the same bundle as the fill. A fill contains the following [event parameter](https://github.com/across-protocol/contracts/blob/a663586e8619bc74cb1da2375107bd5eef0f3144/contracts/interfaces/V3SpokePoolInterface.sol#L124)'s:
 
 ```solidity
 event FilledRelay(
-    uint256 amount,
-    uint256 totalFilledAmount,
-    uint256 fillAmount,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
     uint256 repaymentChainId,
     uint256 indexed originChainId,
-    uint256 destinationChainId,
-    int64 relayerFeePct,
-    int64 realizedLpFeePct,
-    uint32 indexed depositId,
-    address destinationToken,
-    address relayer,
-    address indexed depositor,
-    address recipient,
+    uint256 indexed depositId,
+    uint32 fillDeadline,
+    uint32 exclusivityDeadline,
+    bytess32 exclusiveRelayer,
+    bytes32 indexed relayer,
+    bytes32 depositor,
+    bytes32 recipient,
     bytes message,
-    RelayExecutionInfo updatableRelayData
+    RelayExecutionEventInfo relayExecutionInfo
 );
 ```
 
-A [deposit](https://github.com/across-protocol/contracts/blob/master/contracts/SpokePool.sol#L119) contains:
+A [deposit](https://github.com/across-protocol/contracts/blob/a663586e8619bc74cb1da2375107bd5eef0f3144/contracts/interfaces/V3SpokePoolInterface.sol#L99) contains:
 
 ```solidity
 event FundsDeposited(
-    uint256 amount,
-    uint256 originChainId,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
     uint256 indexed destinationChainId,
-    int64 relayerFeePct,
-    uint32 indexed depositId,
+    uint256 indexed depositId,
     uint32 quoteTimestamp,
-    address originToken,
-    address recipient,
-    address indexed depositor,
+    uint32 fillDeadline,
+    uint32 exclusivityDeadline,
+    bytes32 indexed depositor,
+    bytes32 recipient,
+    bytes32 exclusiveRelayer,
     bytes message
 );
 ```
 
-Therefore, `amount`, `originChainId`, `destinationChainId`, `relayerFeePct`, `depositId`, `destinationToken`, `message`, and `recipient` must match. In addition, the fill's matched deposit must have been emitted from the SpokePool at the `originChainId` of the fill. The fill must have been emitted from the SpokePool on the `destinationChainId`.
+All of the shared event properties must match. In addition, the fill's matched deposit must have been emitted from the SpokePool at the `originChainId` of the fill. The fill must have been emitted from the SpokePool on the `destinationChainId`.
 
-Finally, the fill's `realizedLpFeePct` must be correct. Currently this is deterministically linked with the deposit's `quoteTimestamp`: there is a correct `realizedLpFeePct` for each `quoteTimestamp`, which is computed by querying the HubPool's "utilization" at the Ethereum block height corresponding to the `quoteTimestamp`. This is described in the [UMIP here](https://github.com/UMAprotocol/UMIPs/blob/e3198578b1d339914afa5243a80e3ac8055fba34/UMIPs/umip-157.md#validating-realizedlpfeepct).
+The only exception to the above rule is if `outputToken` is equal to the zero address, then the "equivalent" token address should be substituted in as described in [UMIP-179](https://github.com/UMAprotocol/UMIPs/blob/2046d3cc228cacfb27688fc02e9674aef13445c9/UMIPs/umip-179.md#finding-valid-relays).
 
 ## Incorporating slow fills
 
@@ -231,7 +236,7 @@ This is everything that the Dataworker needs to construct a root bundle! All tha
 
 Root bundle merkle leaf formats
 
-- [PoolRebalanceLeaf](https://github.com/across-protocol/contracts/blob/master/contracts/interfaces/HubPoolInterface.sol#L11): One per chain
-- [RelayerRefundLeaf](https://github.com/across-protocol/contracts/blob/master/contracts/interfaces/SpokePoolInterface.sol#L9) One per token per chain
-- [SlowFillLeaf](https://github.com/across-protocol/contracts/blob/master/contracts/interfaces/SpokePoolInterface.sol#L29) One per unfilled deposit
-- [RootBundle](https://github.com/across-protocol/contracts/blob/master/contracts/interfaces/HubPoolInterface.sol#L53) how the Dataworker's proposal is stored in the HubPool throughout its pending challenge window
+- [PoolRebalanceLeaf](https://github.com/across-protocol/contracts/blob/95c4f923932d597d3e63449718bba5c674b084eb/contracts/interfaces/HubPoolInterface.sol#L11): One per chain
+- [RelayerRefundLeaf](https://github.com/across-protocol/contracts/blob/95c4f923932d597d3e63449718bba5c674b084eb/contracts/interfaces/SpokePoolInterface.sol#L9) One per token per chain
+- [SlowFillLeaf](https://github.com/across-protocol/contracts/blob/95c4f923932d597d3e63449718bba5c674b084eb/contracts/interfaces/V3SpokePoolInterface.sol#L66) One per unfilled deposit
+- [RootBundle](https://github.com/across-protocol/contracts/blob/95c4f923932d597d3e63449718bba5c674b084eb/contracts/interfaces/HubPoolInterface.sol#L53) how the Dataworker's proposal is stored in the HubPool throughout its pending challenge window

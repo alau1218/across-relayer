@@ -1,18 +1,17 @@
-import { interfaces } from "@across-protocol/sdk";
+import { interfaces, utils as sdkUtils } from "@across-protocol/sdk";
 import { HubPoolClient, SpokePoolClient } from "../src/clients";
 import { RelayerRefundLeaf, RunningBalances } from "../src/interfaces";
 import { assert, bnZero, fixedPointAdjustment } from "../src/utils";
 import { amountToDeposit, destinationChainId, mockTreeRoot, originChainId, repaymentChainId } from "./constants";
 import { setupFastDataworker } from "./fixtures/Dataworker.Fixture";
 import {
-  BigNumber,
   Contract,
   SignerWithAddress,
   buildV3SlowRelayLeaves,
   depositV3,
   ethers,
   expect,
-  fillV3,
+  fillV3Relay,
   getDefaultBlockRange,
   requestSlowFill,
   toBN,
@@ -110,8 +109,8 @@ describe("Dataworker: Build merkle roots", async function () {
     const [deposit1] = spokePoolClients[originChainId].getDeposits();
     const [deposit2] = spokePoolClients[destinationChainId].getDeposits();
 
-    await fillV3(spokePool_2, relayer, deposit1, repaymentChainId);
-    await fillV3(spokePool_1, relayer, deposit2, repaymentChainId);
+    await fillV3Relay(spokePool_2, deposit1, relayer, repaymentChainId);
+    await fillV3Relay(spokePool_1, deposit2, relayer, repaymentChainId);
     await updateAllClients();
     const [fill1] = spokePoolClients[destinationChainId].getFills();
     const [fill2] = spokePoolClients[originChainId].getFills();
@@ -221,7 +220,7 @@ describe("Dataworker: Build merkle roots", async function () {
     expect({}).to.deep.equal(merkleRoot1.realizedLpFees);
 
     // Send a fast fill in a second bundle block range.
-    await fillV3(spokePool_2, relayer, deposit, repaymentChainId);
+    await fillV3Relay(spokePool_2, deposit, relayer, repaymentChainId);
     await updateAllClients();
     const [fill] = spokePoolClients[destinationChainId].getFills();
 
@@ -279,7 +278,7 @@ describe("Dataworker: Build merkle roots", async function () {
     const expectedRunningBalances: RunningBalances = {
       // Note: There should be no origin chain entry here since there were no deposits.
       [originChainId]: {
-        [l1Token_1.address]: BigNumber.from(0),
+        [l1Token_1.address]: bnZero,
       },
     };
     expect(expectedRunningBalances).to.deep.equal(merkleRoot1.runningBalances);
@@ -298,7 +297,7 @@ describe("Dataworker: Build merkle roots", async function () {
     await updateAllClients();
     const [deposit] = spokePoolClients[originChainId].getDeposits();
 
-    await fillV3(spokePool_2, relayer, deposit, repaymentChainId);
+    await fillV3Relay(spokePool_2, deposit, relayer, repaymentChainId);
     await updateAllClients();
     const { runningBalances, leaves } = await dataworkerInstance.buildPoolRebalanceRoot(
       getDefaultBlockRange(2),
@@ -359,7 +358,7 @@ describe("Dataworker: Build merkle roots", async function () {
     const slowFillTree = await buildV3SlowRelayTree(slowFills);
     await spokePool_2.relayRootBundle(mockTreeRoot, slowFillTree.getHexRoot());
     await erc20_2.mint(spokePool_2.address, deposit.inputAmount);
-    await spokePool_2.executeV3SlowRelayLeaf(slowFills[0], 0, slowFillTree.getHexProof(slowFills[0]));
+    await spokePool_2.executeSlowRelayLeaf(slowFills[0], 0, slowFillTree.getHexProof(slowFills[0]));
     await updateAllClients();
     const poolRebalanceRoot = await dataworkerInstance.buildPoolRebalanceRoot(
       getDefaultBlockRange(2),
@@ -475,6 +474,15 @@ describe("Dataworker: Build merkle roots", async function () {
       await hubPoolClient.computeRealizedLpFeePct({ ...deposit, paymentChainId: deposit.destinationChainId })
     ).realizedLpFeePct;
     const expectedSlowFillLeaves = buildV3SlowRelayLeaves([deposit], lpFeePct);
-    expect(merkleRoot1.leaves).to.deep.equal(expectedSlowFillLeaves);
+    expect(merkleRoot1.leaves).to.deep.equal(
+      expectedSlowFillLeaves.map((leaf) => {
+        leaf.relayData.inputToken = sdkUtils.toAddress(leaf.relayData.inputToken);
+        leaf.relayData.outputToken = sdkUtils.toAddress(leaf.relayData.outputToken);
+        leaf.relayData.depositor = sdkUtils.toAddress(leaf.relayData.depositor);
+        leaf.relayData.recipient = sdkUtils.toAddress(leaf.relayData.recipient);
+        leaf.relayData.exclusiveRelayer = sdkUtils.toAddress(leaf.relayData.exclusiveRelayer);
+        return leaf;
+      })
+    );
   });
 });
