@@ -74,9 +74,12 @@ export async function constructRelayerClients(
   // bundle and the pending bundle. 8 hours should cover the latest two bundles on production in
   // almost all cases. Look back to genesis on testnets.
   const hubPoolLookBack = sdkUtils.chainIsProd(config.hubPoolChainId) ? 3600 * 8 : Number.POSITIVE_INFINITY;
+  logger.debug({ at: "Relayer#constructRelayerClients", message: "Constructing clients with hubPoolLookBack: " + hubPoolLookBack });
   const commonClients = await constructClients(logger, config, baseSigner, hubPoolLookBack);
   const { configStoreClient, hubPoolClient, multiCallerClient } = commonClients;
+  logger.debug({ at: "Relayer#constructRelayerClients", message: "updating clients..." });
   await updateClients(commonClients, config, logger);
+  logger.debug({ at: "Relayer#constructRelayerClients", message: "updating hubPoolClient...." });
   await hubPoolClient.update();
 
   // If both origin and destination chains are configured, then limit the SpokePoolClients instantiated to the

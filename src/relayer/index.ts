@@ -49,11 +49,13 @@ export async function runRelayer(_logger: winston.Logger, baseSigner: Signer): P
 
   // Explicitly don't log ignoredAddresses because it can be huge and can overwhelm log transports.
   const { ignoredAddresses: _ignoredConfig, ...loggedConfig } = config;
-  logger.debug({ at: "Relayer#run", message: "Relayer started 🏃‍♂️", loggedConfig });
+  logger.debug({ at: "Relayer#run", message: "Relayer started 🏃‍♂️"});
   const mark = profiler.start("relayer");
   const relayerClients = await constructRelayerClients(logger, config, baseSigner);
+  logger.debug({ at: "Relayer#run", message: "Relayer clients constructed...." });
   const relayer = new Relayer(await baseSigner.getAddress(), logger, relayerClients, config);
   await relayer.init();
+  logger.debug({ at: "Relayer#run", message: "Relayer initialized...." });
 
   const { spokePoolClients } = relayerClients;
   const simulate = !sendingTransactionsEnabled;
@@ -100,6 +102,38 @@ export async function runRelayer(_logger: winston.Logger, baseSigner: Signer): P
             logger.debug({ at: "Relayer#run", message: `Handing over to ${botIdentifier} instance ${activeRelayer}.` });
             stop = true;
           }
+        }
+      }
+
+      // Align with Ethereum block clock - pause until the 10th second of an Ethereum slot
+      if (!stop) {
+        const now = new Date().getTime();
+        const slotDuration = 12 * 1000; // 12 seconds per slot in milliseconds
+        
+        // Post-Merge Ethereum genesis timestamp (Sept 15, 2022 - The Merge)
+        // This is in seconds since Unix epoch, so convert to milliseconds
+        const genesisTimestamp = 1663220516 * 1000;
+        
+        // Calculate how many milliseconds have elapsed since genesis
+        const msSinceGenesis = now - genesisTimestamp;
+        
+        // Calculate current position within the slot relative to genesis timing
+        const msIntoSlot = msSinceGenesis % slotDuration;
+        
+        // Target the 10th second (10000ms) of the slot
+        const targetTime = 10000;
+        
+        // Calculate wait time to reach the 10th second of current/next slot
+        const msUntilTarget = msIntoSlot <= targetTime 
+          ? targetTime - msIntoSlot 
+          : slotDuration - msIntoSlot + targetTime;
+        
+        if (msUntilTarget > 0) {
+          logger.debug({
+            at: "Relayer#run",
+            message: `Aligning with Ethereum slot time. Waiting ${msUntilTarget/1000} seconds to reach 10th second of slot.`,
+          });
+          await new Promise(resolve => setTimeout(resolve, msUntilTarget));
         }
       }
 
